@@ -1,22 +1,22 @@
 /**
- * pi-grok-search Extension (v2)
+ * pi-search Extension (v2)
  *
- * 通过 Grok API + Tavily + Firecrawl 为 pi 提供完整的网络访问能力。
- * 参考: https://github.com/GuDaStudio/GrokSearch
+ * 通过可配置搜索模型 API + Tavily + Firecrawl 为 pi 提供完整的网络访问能力。
+ * 参考: OpenAI-compatible search model APIs + Tavily + Firecrawl
  *
  * 双引擎架构:
- *   - Grok: AI 驱动的智能搜索
+ *   - Search Model: AI 驱动的智能搜索
  *   - Tavily: 高保真网页抓取与站点映射
  *   - Firecrawl: Tavily 失败时自动托底
  *
  * 功能:
- *   - grok_search: AI 网络搜索（带信源缓存）
- *   - grok_sources: 获取搜索信源
+ *   - search: AI 网络搜索（带信源缓存）
+ *   - search_sources: 获取搜索信源
  *   - web_fetch: 网页内容抓取（Tavily → Firecrawl → Direct 自动降级）
  *   - web_map: 站点结构映射
  *   - 搜索规划: 6 阶段结构化搜索规划
  *   - 配置诊断: 连接测试 + 模型发现
- *   - CLI 命令: /grok-search, /grok-config, /grok-model, /pi-ext-docs
+ *   - CLI 命令: /search, /search-config, /search-model, /pi-ext-docs
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -41,8 +41,9 @@ const SEARCH_PROFILE_VALUES = [
 ] as const;
 
 type SearchProfile = (typeof SEARCH_PROFILE_VALUES)[number];
+const DEFAULT_SEARCH_API_URL = "https://api.openai.com/v1";
 
-interface GrokConfigFile {
+interface SearchConfigFile {
 	apiUrl?: string;
 	apiKey?: string;
 	model?: string;
@@ -324,7 +325,7 @@ class ConfigManager {
 		this.configPath = join(
 			homedir(),
 			".config",
-			"pi-grok-search",
+			"pi-search",
 			"config.json",
 		);
 	}
@@ -333,7 +334,7 @@ class ConfigManager {
 		return this.configPath;
 	}
 
-	async loadFile(): Promise<GrokConfigFile> {
+	async loadFile(): Promise<SearchConfigFile> {
 		try {
 			const content = await readFile(this.configPath, "utf-8");
 			return JSON.parse(content);
@@ -342,16 +343,16 @@ class ConfigManager {
 		}
 	}
 
-	async saveFile(config: GrokConfigFile): Promise<void> {
+	async saveFile(config: SearchConfigFile): Promise<void> {
 		await mkdir(dirname(this.configPath), { recursive: true });
 		await writeFile(this.configPath, JSON.stringify(config, null, 2), "utf-8");
 		this.modelsCache = null;
 	}
 
 	async getFullConfig(): Promise<{
-		grokApiUrl: string;
-		grokApiKey: string;
-		grokModel: string;
+		searchApiUrl: string;
+		searchApiKey: string;
+		searchModel: string;
 		searchProfile: SearchProfile;
 		tavilyApiUrl: string;
 		tavilyApiKey: string;
@@ -359,16 +360,16 @@ class ConfigManager {
 		firecrawlApiKey: string;
 	}> {
 		const file = await this.loadFile();
-		const grokApiUrl = process.env.GROK_API_URL || file.apiUrl || "";
+		const searchApiUrl = process.env.SEARCH_API_URL || file.apiUrl || DEFAULT_SEARCH_API_URL;
 		return {
-			grokApiUrl,
-			grokApiKey: process.env.GROK_API_KEY || file.apiKey || "",
-			grokModel: normalizeGrokModel(
-				process.env.GROK_MODEL || file.model || "grok-4-fast",
-				grokApiUrl,
+			searchApiUrl,
+			searchApiKey: process.env.SEARCH_API_KEY || file.apiKey || "",
+			searchModel: normalizeSearchModel(
+				process.env.SEARCH_MODEL || file.model || "",
+				searchApiUrl,
 			),
 			searchProfile: normalizeSearchProfile(
-				process.env.GROK_SEARCH_PROFILE || file.searchProfile,
+				process.env.SEARCH_PROFILE || file.searchProfile,
 			),
 			tavilyApiUrl:
 				process.env.TAVILY_API_URL ||
@@ -396,7 +397,7 @@ class ConfigManager {
 		await this.saveFile(file);
 	}
 
-	async setGrokApi(url: string, key: string): Promise<void> {
+	async setSearchApi(url: string, key: string): Promise<void> {
 		const file = await this.loadFile();
 		file.apiUrl = url;
 		file.apiKey = key;
@@ -441,14 +442,15 @@ class ConfigManager {
 
 const configManager = new ConfigManager();
 
-function normalizeGrokModel(model: string, apiUrl: string): string {
+function normalizeSearchModel(model: string, apiUrl: string): string {
+	if (!model.trim()) return "";
 	if (apiUrl.toLowerCase().includes("openrouter") && !model.includes(":online")) {
 		return `${model}:online`;
 	}
 	return model;
 }
 
-const STATUS_KEY = "grok";
+const STATUS_KEY = "search";
 
 type StatusContext = {
 	ui: { setStatus(key: string, text: string | undefined): void };
@@ -457,8 +459,8 @@ type StatusContext = {
 let nextStatusId = 0;
 const activeStatuses: Array<{ id: number; text: string }> = [];
 
-function formatGrokStatus(model: string): string {
-	return `Grok | ${model}`;
+function formatSearchStatus(model: string): string {
+	return `Search | ${model}`;
 }
 
 function beginStatus(ctx: StatusContext, text: string): () => void {
@@ -487,7 +489,7 @@ const DIRECT_FETCH_MAX_INPUT_BYTES = 2 * 1024 * 1024;
 const DIRECT_FETCH_LARGE_BODY_BYTES = 5 * 1024 * 1024;
 const SEARCH_MODE_VALUES: SearchMode[] = ["compact", "normal", "deep", "sources_only"];
 const WEB_FETCH_LIGHT_PROMPT =
-	"web_fetch can be used independently when the user gives a concrete HTTP(S) URL, and it also remains the follow-up inspection tool for selected grok_search sources. Prefer markdown previews; use html/raw/json only for source/API/debug needs.";
+	"web_fetch can be used independently when the user gives a concrete HTTP(S) URL, and it also remains the follow-up inspection tool for selected search sources. Prefer markdown previews; use html/raw/json only for source/API/debug needs.";
 const SEARCH_MODE_DEFAULTS: Record<SearchMode, Omit<SearchControls, "mode">> = {
 	compact: { maxAnswerChars: 6000, maxSources: 8, maxOutputBytes: 12 * 1024 },
 	normal: { maxAnswerChars: 12000, maxSources: 12, maxOutputBytes: 20 * 1024 },
@@ -510,7 +512,7 @@ const SEARCH_PROFILE_DEFS: Record<SearchProfile, SearchProfileDefinition> = {
 		label: "自动",
 		description: "根据问题自动选择搜索策略",
 		lightPrompt:
-			"Current grok_search profile: auto. Let grok_search infer the source strategy, keep results compact, and avoid long page fetches unless needed.",
+			"Current search profile: auto. Let search infer the source strategy, keep results compact, and avoid long page fetches unless needed.",
 		searchPrompt: `# Search Profile: Auto
 
 Infer the best search strategy from the query.
@@ -524,7 +526,7 @@ Keep the result compact unless the query explicitly asks for depth.`,
 		label: "编程文档",
 		description: "官方文档、API、版本、最小示例",
 		lightPrompt:
-			"Current grok_search profile: coding_docs. Prefer official docs, versioned API references, and compact source-first results.",
+			"Current search profile: coding_docs. Prefer official docs, versioned API references, and compact source-first results.",
 		searchPrompt: `# Search Profile: Coding Docs
 
 Goal:
@@ -559,7 +561,7 @@ Avoid:
 		label: "代码示例",
 		description: "GitHub 参考代码、真实项目用法",
 		lightPrompt:
-			"Current grok_search profile: code_examples. Prefer official examples and real repository file links; avoid large code dumps.",
+			"Current search profile: code_examples. Prefer official examples and real repository file links; avoid large code dumps.",
 		searchPrompt: `# Search Profile: Code Examples
 
 Goal:
@@ -593,7 +595,7 @@ Avoid:
 		label: "项目调研",
 		description: "项目、工具、框架、README、issue、changelog",
 		lightPrompt:
-			"Current grok_search profile: project_research. Prefer official sites, README, changelog, release notes, and maintenance signals.",
+			"Current search profile: project_research. Prefer official sites, README, changelog, release notes, and maintenance signals.",
 		searchPrompt: `# Search Profile: Project Research
 
 Goal:
@@ -626,7 +628,7 @@ Avoid:
 		label: "论文资料",
 		description: "论文、报告、DOI、作者年份、证据链",
 		lightPrompt:
-			"Current grok_search profile: academic. Prefer citeable papers, reports, DOI/stable URLs, and multi-source evidence.",
+			"Current search profile: academic. Prefer citeable papers, reports, DOI/stable URLs, and multi-source evidence.",
 		searchPrompt: `# Search Profile: Academic Research
 
 Goal:
@@ -662,7 +664,7 @@ Avoid:
 		label: "事实核查",
 		description: "多来源验证、冲突证据、可信度判断",
 		lightPrompt:
-			"Current grok_search profile: fact_check. Verify claims with independent timely sources and surface conflicts or uncertainty.",
+			"Current search profile: fact_check. Verify claims with independent timely sources and surface conflicts or uncertainty.",
 		searchPrompt: `# Search Profile: Fact Check
 
 Goal:
@@ -729,15 +731,15 @@ function searchProfileFromMenuItem(item: string): SearchProfile | null {
 
 function getDebugConfig(): { enabled: boolean; logDir: string; level: string } {
 	const enabled = ["true", "1", "yes", "on"].includes(
-		(process.env.GROK_DEBUG || "").toLowerCase(),
+		(process.env.SEARCH_DEBUG || "").toLowerCase(),
 	);
-	const configuredDir = process.env.GROK_LOG_DIR || join(homedir(), ".config", "pi-grok-search", "logs");
+	const configuredDir = process.env.SEARCH_LOG_DIR || join(homedir(), ".config", "pi-search", "logs");
 	return {
 		enabled,
 		logDir: isAbsolute(configuredDir)
 			? configuredDir
-			: join(homedir(), ".config", "pi-grok-search", configuredDir),
-		level: (process.env.GROK_LOG_LEVEL || "info").toLowerCase(),
+			: join(homedir(), ".config", "pi-search", configuredDir),
+		level: (process.env.SEARCH_LOG_LEVEL || "info").toLowerCase(),
 	};
 }
 
@@ -747,7 +749,7 @@ async function debugLog(event: string, details: Record<string, unknown> = {}): P
 	try {
 		await mkdir(config.logDir, { recursive: true });
 		const date = new Date().toISOString().slice(0, 10).replace(/-/g, "");
-		const file = join(config.logDir, `pi-grok-search-${date}.log`);
+		const file = join(config.logDir, `pi-search-${date}.log`);
 		const sanitized = sanitizeLogDetails(details);
 		await appendFile(
 			file,
@@ -796,9 +798,9 @@ class HttpStatusError extends Error {
 }
 
 function getRetryConfig(): { maxRetries: number; maxWaitMs: number; multiplierMs: number } {
-	const attempts = Number(process.env.GROK_RETRY_MAX_ATTEMPTS || "3");
-	const maxWait = Number(process.env.GROK_RETRY_MAX_WAIT || "10");
-	const multiplier = Number(process.env.GROK_RETRY_MULTIPLIER || "1");
+	const attempts = Number(process.env.SEARCH_RETRY_MAX_ATTEMPTS || "3");
+	const maxWait = Number(process.env.SEARCH_RETRY_MAX_WAIT || "10");
+	const multiplier = Number(process.env.SEARCH_RETRY_MULTIPLIER || "1");
 	return {
 		maxRetries: Number.isFinite(attempts) && attempts > 0 ? Math.floor(attempts) : 3,
 		maxWaitMs: (Number.isFinite(maxWait) && maxWait > 0 ? maxWait : 10) * 1000,
@@ -984,7 +986,7 @@ function truncateText(
 
 async function saveFullOutput(prefix: string, content: string, extension = "md"): Promise<string | null> {
 	try {
-		const dir = join(tmpdir(), "pi-grok-search");
+		const dir = join(tmpdir(), "pi-search");
 		await mkdir(dir, { recursive: true });
 		const safePrefix = prefix.replace(/[^a-z0-9_-]/gi, "_").slice(0, 40) || "output";
 		const safeExtension = extension.replace(/[^a-z0-9]/gi, "").slice(0, 8) || "txt";
@@ -1495,10 +1497,10 @@ async function getAvailableModelsCached(
 }
 
 // =============================================================================
-// Grok API Client
+// Search API Client
 // =============================================================================
 
-async function grokSearch(
+async function searchWithModel(
 	query: string,
 	platform = "",
 	signal?: AbortSignal,
@@ -1507,16 +1509,19 @@ async function grokSearch(
 	profile: SearchProfile = "auto",
 ): Promise<string> {
 	const config = await configManager.getFullConfig();
-	if (!config.grokApiUrl || !config.grokApiKey) {
-		throw new Error("Grok API 未配置。请使用 /grok-config 命令配置。");
+	if (!config.searchApiUrl || !config.searchApiKey) {
+		throw new Error("Search API 未配置。请使用 /search-config 命令配置。");
+	}
+	if (!modelOverride && !config.searchModel) {
+		throw new Error("搜索模型未配置。请使用 /search-model 或 /search-config 设置模型 ID。");
 	}
 
 	const timeContext = needsTimeContext(query) ? getLocalTimeInfo() : "";
 	const platformPrompt = platform
 		? `\n\nYou should search the web for the information you need, and focus on these platform: ${platform}\n`
 		: "";
-	const effectiveModel = normalizeGrokModel(modelOverride || config.grokModel, config.grokApiUrl);
-	await debugLog("grok.search", {
+	const effectiveModel = normalizeSearchModel(modelOverride || config.searchModel, config.searchApiUrl);
+	await debugLog("search.request", {
 		model: effectiveModel,
 		platform,
 		profile,
@@ -1533,11 +1538,11 @@ async function grokSearch(
 	};
 
 	const response = await fetchWithRetry(
-		`${config.grokApiUrl.replace(/\/+$/, "")}/chat/completions`,
+		`${config.searchApiUrl.replace(/\/+$/, "")}/chat/completions`,
 		{
 			method: "POST",
 			headers: {
-				Authorization: `Bearer ${config.grokApiKey}`,
+				Authorization: `Bearer ${config.searchApiKey}`,
 				"Content-Type": "application/json",
 			},
 			body: JSON.stringify(payload),
@@ -1717,7 +1722,7 @@ async function tavilyMap(
 ): Promise<string> {
 	const config = await configManager.getFullConfig();
 	if (!config.tavilyApiKey) {
-		return "配置错误: TAVILY_API_KEY 未配置，请使用 /grok-config 设置 Tavily API Key。";
+		return "配置错误: TAVILY_API_KEY 未配置，请使用 /search-config 设置 Tavily API Key。";
 	}
 
 	const timeout = options.timeout || 150;
@@ -2382,12 +2387,12 @@ function webFetchDetails(result: WebFetchResult, outputDetails: Record<string, u
 // Prompts
 // =============================================================================
 
-const grokConfigParameters = Type.Object({
+const searchConfigParameters = Type.Object({
 	action: StringEnum(["show", "set", "test"] as const),
 	key: Type.Optional(
 		StringEnum([
-			"grokApiUrl",
-			"grokApiKey",
+			"searchApiUrl",
+			"searchApiKey",
 			"model",
 			"searchProfile",
 			"tavilyApiKey",
@@ -2442,7 +2447,7 @@ function buildSearchPrompt(profile: SearchProfile, controls: SearchControls): st
 
 export default function (pi: ExtensionAPI) {
 	// =========================================================================
-	// Tool: grok_search — AI 网络搜索
+	// Tool: search — AI 网络搜索
 	// =========================================================================
 	pi.on("before_agent_start", async (_event, _ctx) => {
 		const config = await configManager.getFullConfig();
@@ -2452,18 +2457,18 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
-		name: "grok_search",
-		label: "Grok Search",
+		name: "search",
+		label: "Pi Search",
 		description:
-			"通过 Grok API 执行 AI 驱动的深度网络搜索。自动检测时间相关查询并注入时间上下文。\n" +
-			"返回受预算控制的搜索结果正文和 session_id（用于 grok_sources 获取信源）。\n" +
+			"通过 OpenAI-compatible Search API 执行 AI 驱动的深度网络搜索。自动检测时间相关查询并注入时间上下文。\n" +
+			"返回受预算控制的搜索结果正文和 session_id（用于 search_sources 获取信源）。\n" +
 			"默认 compact 模式，适用：查找技术文档、API 规范、开源项目、pi Extension 开发指南等。",
 		promptSnippet:
-			"通过 Grok API 执行 AI 深度网络搜索（文档、API、开源项目等）",
+			"通过 OpenAI-compatible Search API 执行 AI 深度网络搜索（文档、API、开源项目等）",
 		promptGuidelines: [
-			"Use grok_search when external, recent, or authoritative web information is needed.",
-			"Search queries to grok_search should be in English when possible; answer the user in Chinese unless requested otherwise.",
-			"Prefer the active grok_search profile; pass profile explicitly only when the user asks for a different search style.",
+			"Use search when external, recent, or authoritative web information is needed.",
+			"Search queries to search should be in English when possible; answer the user in Chinese unless requested otherwise.",
+			"Prefer the active search profile; pass profile explicitly only when the user asks for a different search style.",
 			"For programming tasks, prefer official docs and GitHub sources; use web_fetch only for selected high-value pages.",
 			"Avoid injecting long web pages into context; prefer compact results, source lists, and targeted fetches.",
 		],
@@ -2488,7 +2493,7 @@ export default function (pi: ExtensionAPI) {
 			profile: Type.Optional(
 				StringEnum(SEARCH_PROFILE_VALUES, {
 					description:
-						"搜索场景预设。默认使用 /grok-config 中保存的全局模式。",
+						"搜索场景预设。默认使用 /search-config 中保存的全局模式。",
 				}),
 			),
 			mode: Type.Optional(
@@ -2526,24 +2531,24 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const config = await configManager.getFullConfig();
-			const effectiveModel = normalizeGrokModel(params.model || config.grokModel, config.grokApiUrl);
+			const effectiveModel = normalizeSearchModel(params.model || config.searchModel, config.searchApiUrl);
 			const profile = parseSearchProfile(params.profile) || config.searchProfile;
 			const controls = resolveSearchControls(params, profile);
-			const endStatus = beginStatus(ctx, formatGrokStatus(effectiveModel));
+			const endStatus = beginStatus(ctx, formatSearchStatus(effectiveModel));
 			onUpdate?.({ content: [{ type: "text", text: "🔍 正在搜索..." }], details: {} });
 
 			try {
 				const sessionId = newSessionId();
 
-				// Parallel: Grok search + optional Tavily/Firecrawl
+				// Parallel: Search Model search + optional Tavily/Firecrawl
 				const hasTavily = !!config.tavilyApiKey;
 				const hasFirecrawl = !!config.firecrawlApiKey;
 				const extraBudget = splitExtraSourceBudget(params.extra_sources || 0, hasTavily, hasFirecrawl);
 
-				if (params.model && config.grokApiUrl && config.grokApiKey) {
+				if (params.model && config.searchApiUrl && config.searchApiKey) {
 					const models = await getAvailableModelsCached(
-						config.grokApiUrl,
-						config.grokApiKey,
+						config.searchApiUrl,
+						config.searchApiKey,
 						signal,
 					);
 					if (models.length > 0 && !models.includes(effectiveModel)) {
@@ -2552,7 +2557,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				const tasks: Promise<unknown>[] = [
-					grokSearch(params.query, params.platform || "", signal, effectiveModel, controls, profile),
+					searchWithModel(params.query, params.platform || "", signal, effectiveModel, controls, profile),
 				];
 
 				if (extraBudget.tavily > 0) {
@@ -2566,12 +2571,12 @@ export default function (pi: ExtensionAPI) {
 
 				if (results[0]?.status === "rejected") {
 					if (results.length === 1) throw results[0].reason;
-					await debugLog("grok.search_primary_failed", {
+					await debugLog("search.primary_failed", {
 						error: results[0].reason instanceof Error ? results[0].reason.message : String(results[0].reason),
 					});
 				}
 
-				const grokResult = getSettledValue<string>(results[0], "");
+				const primaryResult = getSettledValue<string>(results[0], "");
 				let resultIndex = 1;
 				const tavilySources =
 					extraBudget.tavily > 0
@@ -2582,11 +2587,11 @@ export default function (pi: ExtensionAPI) {
 						? getSettledValue<Source[]>(results[resultIndex], [])
 						: [];
 
-				// Parse Grok response
-				const { answer, sources: grokSources } =
-					splitAnswerAndSources(grokResult);
+				// Parse Search Model response
+				const { answer, sources: primarySources } =
+					splitAnswerAndSources(primaryResult);
 				const allSources = mergeSources(
-					grokSources,
+					primarySources,
 					tavilySources,
 					firecrawlSources,
 				);
@@ -2601,8 +2606,8 @@ export default function (pi: ExtensionAPI) {
 				if (limitedAnswer.truncated) {
 					output += `\n\n[Answer truncated to ${controls.maxAnswerChars} characters. Use narrower queries or mode=deep for a larger budget.]`;
 				}
-				if (!grokResult && allSources.length > 0) {
-					output = "⚠️ Grok 主搜索失败，仅返回补充信源。";
+				if (!primaryResult && allSources.length > 0) {
+					output = "⚠️ 搜索模型主搜索失败，仅返回补充信源。";
 				}
 				if (visibleSources.length > 0) {
 					output += `\n\n---\n**信源 (${visibleSources.length}/${allSources.length})** | session_id: \`${sessionId}\`\n`;
@@ -2610,14 +2615,14 @@ export default function (pi: ExtensionAPI) {
 						output += s.title ? `- [${s.title}](${s.url})\n` : `- ${s.url}\n`;
 					}
 					if (allSources.length > visibleSources.length) {
-						output += `- ... 还有 ${allSources.length - visibleSources.length} 个信源，使用 grok_sources 分页获取\n`;
+						output += `- ... 还有 ${allSources.length - visibleSources.length} 个信源，使用 search_sources 分页获取\n`;
 					}
 				} else if (allSources.length > 0) {
-					output += `\n\n---\n**信源已缓存 (${allSources.length})** | session_id: \`${sessionId}\`，使用 grok_sources 分页获取\n`;
+					output += `\n\n---\n**信源已缓存 (${allSources.length})** | session_id: \`${sessionId}\`，使用 search_sources 分页获取\n`;
 				}
 				if (!output.trim()) output = "未返回可显示内容。请尝试 normal/deep 模式或缩小查询。";
 
-				const finalOutput = await truncateToolOutput(output, "grok-search", { maxBytes: controls.maxOutputBytes });
+				const finalOutput = await truncateToolOutput(output, "search", { maxBytes: controls.maxOutputBytes });
 				const { content, ...outputDetails } = finalOutput;
 				return {
 					content: [{ type: "text", text: content }],
@@ -2643,20 +2648,20 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// =========================================================================
-	// Tool: grok_sources — 获取缓存信源
+	// Tool: search_sources — 获取缓存信源
 	// =========================================================================
 	pi.registerTool({
-		name: "grok_sources",
-		label: "Grok Sources",
+		name: "search_sources",
+		label: "Search Sources",
 		description:
-			"通过 session_id 分页获取之前 grok_search 缓存的信源列表。\n" +
+			"通过 session_id 分页获取之前 search 缓存的信源列表。\n" +
 			"当对搜索结果感兴趣或需要更多参考链接时使用。",
 		promptSnippet: "通过 session_id 获取搜索信源列表",
 		promptGuidelines: [
-			"Use grok_sources with the session_id from grok_search to retrieve source URLs page by page when you need more references.",
+			"Use search_sources with the session_id from search to retrieve source URLs page by page when you need more references.",
 		],
 		parameters: Type.Object({
-			session_id: Type.String({ description: "grok_search 返回的 session_id" }),
+			session_id: Type.String({ description: "search 返回的 session_id" }),
 			limit: Type.Optional(
 				Type.Number({ description: "本次返回信源数量（1-100），默认 20", minimum: 1, maximum: 100 }),
 			),
@@ -2709,7 +2714,7 @@ export default function (pi: ExtensionAPI) {
 				output += "\n";
 			}
 			if (offset + page.length < sources.length) {
-				output += `\n下一页: grok_sources(session_id=\`${params.session_id}\`, offset=${offset + page.length}, limit=${limit})\n`;
+				output += `\n下一页: search_sources(session_id=\`${params.session_id}\`, offset=${offset + page.length}, limit=${limit})\n`;
 			}
 
 			return {
@@ -2734,16 +2739,16 @@ export default function (pi: ExtensionAPI) {
 		description:
 			"独立抓取一个明确的 HTTP/HTTPS URL，并返回受输出预算保护的页面/API 预览。\n" +
 			"默认 format=markdown；markdown/text 优先使用 Tavily Extract，markdown/html/raw 可降级到 Firecrawl Scrape，最后使用带常见浏览器请求头的 direct fetch。\n" +
-			"可独立用于用户给定 URL，也可作为 grok_search 后检查选中信源的后续工具；不执行 JavaScript，不处理登录会话，也不是批量下载器。",
-		promptSnippet: "独立抓取指定 URL 预览；也可检查 grok_search 选中信源",
+			"可独立用于用户给定 URL，也可作为 search 后检查选中信源的后续工具；不执行 JavaScript，不处理登录会话，也不是批量下载器。",
+		promptSnippet: "独立抓取指定 URL 预览；也可检查 search 选中信源",
 		promptGuidelines: [
 			"Use web_fetch directly when the user provides a concrete HTTP(S) URL and asks to read, inspect, summarize, verify, or debug that page/API response.",
-			"Keep the existing search flow: when the URL is unknown, use grok_search first, then web_fetch only for selected high-value source URLs that need inspection.",
+			"Keep the existing search flow: when the URL is unknown, use search first, then web_fetch only for selected high-value source URLs that need inspection.",
 			"Default to format=markdown for readable page previews. Use format=text for plain text, html for cleaned/source HTML inspection, json for API payloads or structured metadata, and raw only for bounded raw-body/rawHtml debugging.",
 			"Use returned details.metadata for status, final URL, content type, content length, title, description, canonical URL, and binary/large-file decisions.",
 			"Do not treat web_fetch as a browser, JavaScript renderer, login/session tool, bulk downloader, or anti-bot bypass; large/binary targets should be summarized by metadata instead of injected.",
 			"Respect the context budget: fetch one URL at a time, avoid raw/html unless needed, and increase max_output_bytes only when the user explicitly needs more content.",
-			"If extraction is thin, truncated, blocked, or mismatched, report that limitation and switch back to grok_search or a narrower URL instead of repeatedly fetching broad pages.",
+			"If extraction is thin, truncated, blocked, or mismatched, report that limitation and switch back to search or a narrower URL instead of repeatedly fetching broad pages.",
 		],
 		parameters: Type.Object({
 			url: Type.String({ description: "要抓取的网页 URL（HTTP/HTTPS）" }),
@@ -2770,7 +2775,7 @@ export default function (pi: ExtensionAPI) {
 					details: { url: params.url, format, error: "invalid_url" },
 				};
 			}
-			const endStatus = beginStatus(ctx, formatGrokStatus(config.grokModel));
+			const endStatus = beginStatus(ctx, formatSearchStatus(config.searchModel));
 			onUpdate?.({ content: [{ type: "text", text: `📄 正在抓取网页 (${format})...` }], details: {} });
 
 			try {
@@ -2799,7 +2804,7 @@ export default function (pi: ExtensionAPI) {
 					content: [
 						{
 							type: "text",
-							text: "提取失败: Tavily/Firecrawl/direct fetch 均未能获取可注入的文本内容。可尝试用 grok_search 搜索相关内容。",
+							text: "提取失败: Tavily/Firecrawl/direct fetch 均未能获取可注入的文本内容。可尝试用 search 搜索相关内容。",
 						},
 					],
 					details: {
@@ -2856,7 +2861,7 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const config = await configManager.getFullConfig();
-			const endStatus = beginStatus(ctx, formatGrokStatus(config.grokModel));
+			const endStatus = beginStatus(ctx, formatSearchStatus(config.searchModel));
 			try {
 				const result = await tavilyMap(
 					params.url,
@@ -2884,27 +2889,27 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// =========================================================================
-	// Tool: grok_config — 配置管理
+	// Tool: search_config — 配置管理
 	// =========================================================================
-	pi.registerTool<typeof grokConfigParameters, Record<string, unknown>>({
-		name: "grok_config",
-		label: "Grok Config",
+	pi.registerTool<typeof searchConfigParameters, Record<string, unknown>>({
+		name: "search_config",
+		label: "Search Config",
 		description:
-			"查看或修改 Grok Search 的完整配置（Grok/Tavily/Firecrawl API）。",
-		promptSnippet: "查看或修改 Grok Search 配置",
-		parameters: grokConfigParameters,
+			"查看或修改 Pi Search 的完整配置（OpenAI-compatible Search API/Tavily/Firecrawl API）。",
+		promptSnippet: "查看或修改 Pi Search 配置",
+		parameters: searchConfigParameters,
 
 		async execute(_toolCallId, params) {
 			const config = await configManager.getFullConfig();
 
 			if (params.action === "show") {
 				const lines = [
-					"## Grok Search 配置\n",
+					"## Pi Search 配置\n",
 					"| 配置项 | 值 |",
 					"|--------|-----|",
-					`| Grok API URL | ${config.grokApiUrl || "❌ 未配置"} |`,
-					`| Grok API Key | ${config.grokApiKey ? configManager.maskKey(config.grokApiKey) : "❌ 未配置"} |`,
-					`| Grok 模型 | ${config.grokModel} |`,
+					`| Search API URL | ${config.searchApiUrl || "❌ 未配置"} |`,
+					`| Search API Key | ${config.searchApiKey ? configManager.maskKey(config.searchApiKey) : "❌ 未配置"} |`,
+					`| 搜索模型 | ${config.searchModel} |`,
 					`| 搜索模式 | ${formatSearchProfile(config.searchProfile)} |`,
 					`| Tavily API URL | ${config.tavilyApiUrl} |`,
 					`| Tavily API Key | ${config.tavilyApiKey ? configManager.maskKey(config.tavilyApiKey) : "❌ 未配置"} |`,
@@ -2922,14 +2927,14 @@ export default function (pi: ExtensionAPI) {
 			if (params.action === "test") {
 				const results: string[] = ["## 连接测试\n"];
 
-				// Test Grok
-				if (config.grokApiUrl && config.grokApiKey) {
+				// Test Search Model
+				if (config.searchApiUrl && config.searchApiKey) {
 					try {
 						const start = Date.now();
-						const models = await getAvailableModelsCached(config.grokApiUrl, config.grokApiKey);
+						const models = await getAvailableModelsCached(config.searchApiUrl, config.searchApiKey);
 						const elapsed = Date.now() - start;
 						results.push(
-							`✅ **Grok API**: 连接成功 (${elapsed}ms)，${models.length} 个模型`,
+							`✅ **Search API**: 连接成功 (${elapsed}ms)，${models.length} 个模型`,
 						);
 						if (models.length > 0) {
 							results.push(
@@ -2938,11 +2943,11 @@ export default function (pi: ExtensionAPI) {
 						}
 					} catch (e) {
 						results.push(
-							`❌ **Grok API**: ${e instanceof Error ? e.message : String(e)}`,
+							`❌ **Search API**: ${e instanceof Error ? e.message : String(e)}`,
 						);
 					}
 				} else {
-					results.push("⏭️ **Grok API**: 未配置");
+					results.push("⏭️ **Search API**: 未配置");
 				}
 
 				// Test Tavily
@@ -2985,18 +2990,18 @@ export default function (pi: ExtensionAPI) {
 					: params.value;
 
 				switch (params.key) {
-					case "grokApiUrl": {
+					case "searchApiUrl": {
 						const file = await configManager.loadFile();
-						await configManager.setGrokApi(
+						await configManager.setSearchApi(
 							params.value,
-							file.apiKey || config.grokApiKey,
+							file.apiKey || config.searchApiKey,
 						);
 						break;
 					}
-					case "grokApiKey": {
+					case "searchApiKey": {
 						const file = await configManager.loadFile();
-						await configManager.setGrokApi(
-							file.apiUrl || config.grokApiUrl,
+						await configManager.setSearchApi(
+							file.apiUrl || config.searchApiUrl,
 							params.value,
 						);
 						break;
@@ -3197,7 +3202,7 @@ export default function (pi: ExtensionAPI) {
 			boundary: Type.String({ description: "What this excludes; should be mutually exclusive with siblings" }),
 			confidence: Type.Optional(Type.Number({ description: "Confidence 0.0-1.0", minimum: 0, maximum: 1 })),
 			depends_on: Type.Optional(Type.Array(Type.String(), { description: "Prerequisite sub-query IDs" })),
-			tool_hint: Type.Optional(StringEnum(["grok_search", "web_fetch", "web_map"] as const)),
+			tool_hint: Type.Optional(StringEnum(["search", "web_fetch", "web_map"] as const)),
 			is_revision: Type.Optional(Type.Boolean({ description: "True to replace all sub-queries" })),
 		}),
 		async execute(_toolCallId, params) {
@@ -3272,7 +3277,7 @@ export default function (pi: ExtensionAPI) {
 			session_id: Type.String({ description: "Session ID from plan_intent" }),
 			thought: Type.String({ description: "Reasoning for this mapping" }),
 			sub_query_id: Type.String({ description: "Sub-query ID to map" }),
-			tool: StringEnum(["grok_search", "web_fetch", "web_map"] as const),
+			tool: StringEnum(["search", "web_fetch", "web_map"] as const),
 			reason: Type.String({ description: "Why this tool for this sub-query" }),
 			confidence: Type.Optional(Type.Number({ description: "Confidence 0.0-1.0", minimum: 0, maximum: 1 })),
 			params_json: Type.Optional(Type.String({ description: "Optional JSON string for tool-specific params" })),
@@ -3343,22 +3348,22 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// =========================================================================
-	// Command: /grok-search
+	// Command: /search
 	// =========================================================================
-	pi.registerCommand("grok-search", {
-		description: "使用 Grok 搜索网络（/grok-search <query>）",
+	pi.registerCommand("search", {
+		description: "使用搜索模型搜索网络（/search <query>）",
 		handler: async (args, ctx) => {
 			if (!args.trim()) {
-				ctx.ui.notify("用法: /grok-search <搜索内容>", "warning");
+				ctx.ui.notify("用法: /search <搜索内容>", "warning");
 				return;
 			}
 
 			const config = await configManager.getFullConfig();
-			const endStatus = beginStatus(ctx, formatGrokStatus(config.grokModel));
+			const endStatus = beginStatus(ctx, formatSearchStatus(config.searchModel));
 
 			try {
 				const controls = resolveSearchControls({ mode: "compact" }, config.searchProfile);
-				const raw = await grokSearch(args.trim(), "", undefined, "", controls, config.searchProfile);
+				const raw = await searchWithModel(args.trim(), "", undefined, "", controls, config.searchProfile);
 				const { answer, sources } = splitAnswerAndSources(raw);
 				const limitedAnswer = limitText(answer, controls.maxAnswerChars);
 
@@ -3375,15 +3380,15 @@ export default function (pi: ExtensionAPI) {
 						output += s.title ? `- [${s.title}](${s.url})\n` : `- ${s.url}\n`;
 					}
 					if (sources.length > visibleSources.length) {
-						output += `- ... 还有 ${sources.length - visibleSources.length} 个信源，使用 grok_sources 分页获取\n`;
+						output += `- ... 还有 ${sources.length - visibleSources.length} 个信源，使用 search_sources 分页获取\n`;
 					}
 				}
 				if (!output.trim()) output = "未返回可显示内容。请尝试 normal/deep 模式或缩小查询。";
 
-				const rendered = await truncateToolOutput(output, "grok-search-command", { maxBytes: controls.maxOutputBytes });
+				const rendered = await truncateToolOutput(output, "search-command", { maxBytes: controls.maxOutputBytes });
 				pi.sendMessage(
 					{
-						customType: "grok-search",
+						customType: "search",
 						content: rendered.content,
 						display: true,
 						details: { sources_count: sources.length, profile: config.searchProfile },
@@ -3402,15 +3407,15 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// =========================================================================
-	// Command: /grok-config
+	// Command: /search-config
 	// =========================================================================
-	pi.registerCommand("grok-config", {
-		description: "配置 Grok Search（Grok / Tavily / Firecrawl API）",
+	pi.registerCommand("search-config", {
+		description: "配置 Pi Search（Search API / Tavily / Firecrawl API）",
 		handler: async (_args, ctx) => {
 			const config = await configManager.getFullConfig();
-			const choice = await ctx.ui.select("Grok Search 配置:", [
+			const choice = await ctx.ui.select("Pi Search 配置:", [
 				"查看当前配置",
-				"设置 Grok API",
+				"设置 Search API",
 				"设置 Tavily API",
 				"设置 Firecrawl API",
 				"切换模型",
@@ -3438,8 +3443,8 @@ export default function (pi: ExtensionAPI) {
 				case "查看当前配置": {
 					const config = await configManager.getFullConfig();
 					const lines = [
-						`Grok: ${config.grokApiUrl || "未配置"} | ${config.grokApiKey ? configManager.maskKey(config.grokApiKey) : "未配置"}`,
-						`模型: ${config.grokModel}`,
+						`Search API: ${config.searchApiUrl || "未配置"} | ${config.searchApiKey ? configManager.maskKey(config.searchApiKey) : "未配置"}`,
+						`模型: ${config.searchModel}`,
 						`搜索模式: ${formatSearchProfile(config.searchProfile)}`,
 						`Tavily: ${config.tavilyApiKey ? configManager.maskKey(config.tavilyApiKey) : "未配置"}`,
 						`Firecrawl: ${config.firecrawlApiKey ? configManager.maskKey(config.firecrawlApiKey) : "未配置"}`,
@@ -3448,16 +3453,16 @@ export default function (pi: ExtensionAPI) {
 					break;
 				}
 
-				case "设置 Grok API": {
+				case "设置 Search API": {
 					const url = await ctx.ui.input(
-						"Grok API URL:",
-						"https://api.x.ai/v1",
+						"Search API URL:",
+						DEFAULT_SEARCH_API_URL,
 					);
 					if (!url) return;
-					const key = await ctx.ui.input("Grok API Key:", "");
+					const key = await ctx.ui.input("Search API Key:", "");
 					if (!key) return;
-					await configManager.setGrokApi(url, key);
-					ctx.ui.notify(`✅ Grok API 已配置`, "info");
+					await configManager.setSearchApi(url, key);
+					ctx.ui.notify(`✅ Search API 已配置`, "info");
 					break;
 				}
 
@@ -3481,13 +3486,13 @@ export default function (pi: ExtensionAPI) {
 					const config = await configManager.getFullConfig();
 					ctx.ui.notify("正在获取可用模型...", "info");
 					const models = await getAvailableModelsCached(
-						config.grokApiUrl,
-						config.grokApiKey,
+						config.searchApiUrl,
+						config.searchApiKey,
 					);
 
 					if (models.length > 0) {
 						const choice = await ctx.ui.select(
-							`当前: ${config.grokModel}`,
+							`当前: ${config.searchModel}`,
 							models,
 						);
 						if (choice) {
@@ -3495,7 +3500,7 @@ export default function (pi: ExtensionAPI) {
 							ctx.ui.notify(`✅ 模型已切换: ${choice}`, "info");
 						}
 					} else {
-						const model = await ctx.ui.input("输入模型 ID:", config.grokModel);
+						const model = await ctx.ui.input("输入模型 ID:", config.searchModel);
 						if (model) {
 							await configManager.setModel(model);
 							ctx.ui.notify(`✅ 模型已切换: ${model}`, "info");
@@ -3509,20 +3514,20 @@ export default function (pi: ExtensionAPI) {
 					const results: string[] = [];
 					const config = await configManager.getFullConfig();
 
-					if (config.grokApiUrl && config.grokApiKey) {
+					if (config.searchApiUrl && config.searchApiKey) {
 						try {
 							const start = Date.now();
 							const models = await getAvailableModelsCached(
-								config.grokApiUrl,
-								config.grokApiKey,
+								config.searchApiUrl,
+								config.searchApiKey,
 							);
 							const elapsed = Date.now() - start;
-							results.push(`✅ Grok: ${elapsed}ms, ${models.length} 模型`);
+							results.push(`✅ Search API: ${elapsed}ms, ${models.length} 模型`);
 						} catch {
-							results.push("❌ Grok: 连接失败");
+							results.push("❌ Search API: 连接失败");
 						}
 					} else {
-						results.push("⏭️ Grok: 未配置");
+						results.push("⏭️ Search API: 未配置");
 					}
 
 					results.push(
@@ -3542,10 +3547,10 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// =========================================================================
-	// Command: /grok-model
+	// Command: /search-model
 	// =========================================================================
-	pi.registerCommand("grok-model", {
-		description: "快速切换 Grok 模型（/grok-model [model-id]）",
+	pi.registerCommand("search-model", {
+		description: "快速切换搜索模型（/search-model [model-id]）",
 		handler: async (args, ctx) => {
 			if (args.trim()) {
 				await configManager.setModel(args.trim());
@@ -3556,18 +3561,18 @@ export default function (pi: ExtensionAPI) {
 			const config = await configManager.getFullConfig();
 			ctx.ui.notify("正在获取可用模型...", "info");
 			const models = await getAvailableModelsCached(
-				config.grokApiUrl,
-				config.grokApiKey,
+				config.searchApiUrl,
+				config.searchApiKey,
 			);
 
 			if (models.length > 0) {
-				const choice = await ctx.ui.select(`当前: ${config.grokModel}`, models);
+				const choice = await ctx.ui.select(`当前: ${config.searchModel}`, models);
 				if (choice) {
 					await configManager.setModel(choice);
 					ctx.ui.notify(`✅ 模型已切换: ${choice}`, "info");
 				}
 			} else {
-				const model = await ctx.ui.input("输入模型 ID:", config.grokModel);
+				const model = await ctx.ui.input("输入模型 ID:", config.searchModel);
 				if (model) {
 					await configManager.setModel(model);
 					ctx.ui.notify(`✅ 模型已切换: ${model}`, "info");
@@ -3585,12 +3590,12 @@ export default function (pi: ExtensionAPI) {
 			const topic =
 				args.trim() || "pi Extension API registerTool registerCommand";
 			const config = await configManager.getFullConfig();
-			const endStatus = beginStatus(ctx, formatGrokStatus(config.grokModel));
+			const endStatus = beginStatus(ctx, formatSearchStatus(config.searchModel));
 
 			try {
 				const profile: SearchProfile = "coding_docs";
 				const controls = resolveSearchControls({ mode: "compact", max_sources: 8 }, profile);
-				const raw = await grokSearch(
+				const raw = await searchWithModel(
 					`site:github.com earendil-works pi coding agent extensions ${topic}`,
 					"",
 					undefined,
@@ -3617,7 +3622,7 @@ export default function (pi: ExtensionAPI) {
 				const rendered = await truncateToolOutput(output, "pi-ext-docs", { maxBytes: controls.maxOutputBytes });
 				pi.sendMessage(
 					{
-						customType: "grok-search",
+						customType: "search",
 						content: rendered.content,
 						display: true,
 						details: { sources_count: sources.length, profile },
@@ -3638,8 +3643,8 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 	// Message Renderer
 	// =========================================================================
-	pi.registerMessageRenderer("grok-search", (message, _options, theme) => {
-		let text = theme.fg("accent", "🔍 Grok Search\n\n");
+	pi.registerMessageRenderer("search", (message, _options, theme) => {
+		let text = theme.fg("accent", "🔍 Pi Search\n\n");
 		text += message.content;
 		return new Text(text, 0, 0);
 	});

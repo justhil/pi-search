@@ -1,17 +1,17 @@
 {
-  "name": "pi-grok-search",
+  "name": "pi-search",
   "version": "2.0.0",
-  "description": "Grok Search Extension for pi - 双引擎架构：Grok AI 搜索 + Tavily 抓取 + Firecrawl 托底",
-  "keywords": ["pi-package", "pi-extension", "grok", "search", "tavily", "firecrawl"],
+  "description": "Generic Search Extension for pi - 搜索模型 API + Tavily 抓取 + Firecrawl 托底",
+  "keywords": ["pi-package", "pi-extension", "search", "tavily", "firecrawl"],
   "type": "module",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/justhiL/pi-grok-search.git"
+    "url": "https://github.com/justhil/pi-search.git"
   },
   "pi": {
     "extensions": ["./index.ts"],
-    "image": "https://raw.githubusercontent.com/justhiL/pi-grok-search/main/screenshot.png"
+    "image": "https://raw.githubusercontent.com/justhil/pi-search/main/screenshot.png"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
