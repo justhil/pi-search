@@ -12,7 +12,7 @@
  * 功能:
  *   - grok_search: AI 网络搜索（带信源缓存）
  *   - grok_sources: 获取搜索信源
- *   - web_fetch: 网页内容抓取（Tavily → Firecrawl 自动降级）
+ *   - web_fetch: 网页内容抓取（Tavily → Firecrawl → Direct 自动降级）
  *   - web_map: 站点结构映射
  *   - 搜索规划: 6 阶段结构化搜索规划
  *   - 配置诊断: 连接测试 + 模型发现
@@ -61,6 +61,30 @@ interface Source {
 }
 
 type SearchMode = "compact" | "normal" | "deep" | "sources_only";
+const WEB_FETCH_FORMAT_VALUES = ["markdown", "text", "html", "json", "raw"] as const;
+type WebFetchFormat = (typeof WEB_FETCH_FORMAT_VALUES)[number];
+type WebFetchProvider = "tavily" | "firecrawl" | "direct";
+
+interface WebFetchMetadata {
+	url: string;
+	finalUrl?: string;
+	status?: number;
+	contentType?: string;
+	contentLength?: number;
+	contentDisposition?: string;
+	title?: string;
+	description?: string;
+	canonicalUrl?: string;
+	language?: string;
+	favicon?: string;
+}
+
+interface WebFetchResult {
+	content: string;
+	provider: WebFetchProvider;
+	format: WebFetchFormat;
+	metadata: WebFetchMetadata;
+}
 
 interface SearchControls {
 	mode: SearchMode;
@@ -458,7 +482,12 @@ const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 const DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024;
 const DEFAULT_MAX_OUTPUT_LINES = 800;
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
+const DIRECT_FETCH_MIN_INPUT_BYTES = 256 * 1024;
+const DIRECT_FETCH_MAX_INPUT_BYTES = 2 * 1024 * 1024;
+const DIRECT_FETCH_LARGE_BODY_BYTES = 5 * 1024 * 1024;
 const SEARCH_MODE_VALUES: SearchMode[] = ["compact", "normal", "deep", "sources_only"];
+const WEB_FETCH_LIGHT_PROMPT =
+	"web_fetch can be used independently when the user gives a concrete HTTP(S) URL, and it also remains the follow-up inspection tool for selected grok_search sources. Prefer markdown previews; use html/raw/json only for source/API/debug needs.";
 const SEARCH_MODE_DEFAULTS: Record<SearchMode, Omit<SearchControls, "mode">> = {
 	compact: { maxAnswerChars: 6000, maxSources: 8, maxOutputBytes: 12 * 1024 },
 	normal: { maxAnswerChars: 12000, maxSources: 12, maxOutputBytes: 20 * 1024 },
@@ -953,12 +982,13 @@ function truncateText(
 	};
 }
 
-async function saveFullOutput(prefix: string, content: string): Promise<string | null> {
+async function saveFullOutput(prefix: string, content: string, extension = "md"): Promise<string | null> {
 	try {
 		const dir = join(tmpdir(), "pi-grok-search");
 		await mkdir(dir, { recursive: true });
 		const safePrefix = prefix.replace(/[^a-z0-9_-]/gi, "_").slice(0, 40) || "output";
-		const file = join(dir, `${safePrefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.md`);
+		const safeExtension = extension.replace(/[^a-z0-9]/gi, "").slice(0, 8) || "txt";
+		const file = join(dir, `${safePrefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${safeExtension}`);
 		await writeFile(file, content, "utf8");
 		return file;
 	} catch {
@@ -972,7 +1002,14 @@ function formatSize(bytes: number): string {
 	return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
 }
 
-async function truncateToolOutput(content: string, prefix: string, options: { maxBytes?: number; maxLines?: number } = {}): Promise<{
+function extensionForOutputFormat(format: WebFetchFormat): string {
+	if (format === "json") return "json";
+	if (format === "html") return "html";
+	if (format === "text" || format === "raw") return "txt";
+	return "md";
+}
+
+async function truncateToolOutput(content: string, prefix: string, options: { maxBytes?: number; maxLines?: number; extension?: string } = {}): Promise<{
 	content: string;
 	truncated: boolean;
 	fullOutputPath?: string;
@@ -984,7 +1021,7 @@ async function truncateToolOutput(content: string, prefix: string, options: { ma
 	const truncation = truncateText(content, options);
 	if (!truncation.truncated) return truncation;
 
-	const fullOutputPath = await saveFullOutput(prefix, content);
+	const fullOutputPath = await saveFullOutput(prefix, content, options.extension);
 	let notice =
 		`\n\n[Output truncated: ${truncation.outputLines} of ${truncation.totalLines} lines ` +
 		`(${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}).`;
@@ -1622,10 +1659,11 @@ async function tavilySearch(
 
 async function tavilyExtract(
 	url: string,
+	format: WebFetchFormat = "markdown",
 	signal?: AbortSignal,
-): Promise<string | null> {
+): Promise<WebFetchResult | null> {
 	const config = await configManager.getFullConfig();
-	if (!config.tavilyApiKey) return null;
+	if (!config.tavilyApiKey || !["markdown", "text"].includes(format)) return null;
 
 	try {
 		const response = await fetchWithRetry(
@@ -1636,21 +1674,32 @@ async function tavilyExtract(
 					Authorization: `Bearer ${config.tavilyApiKey}`,
 					"Content-Type": "application/json",
 				},
-				body: JSON.stringify({ urls: [url], format: "markdown" }),
+				body: JSON.stringify({ urls: [url], format }),
 				signal: createTimeoutSignal(DEFAULT_REQUEST_TIMEOUT_MS, signal),
 			},
 		);
 
 		const data = (await response.json()) as {
-			results?: Array<{ raw_content?: string }>;
+			results?: Array<{ url?: string; raw_content?: string; favicon?: string }>;
 		};
 
-		const content = data.results?.[0]?.raw_content;
-		await debugLog("tavily.extract", { url, success: !!content?.trim() });
-		return content?.trim() || null;
+		const item = data.results?.[0];
+		const content = item?.raw_content?.trim();
+		await debugLog("tavily.extract", { url, format, success: !!content });
+		if (!content) return null;
+		return {
+			content,
+			provider: "tavily",
+			format,
+			metadata: {
+				url,
+				...(item?.url ? { finalUrl: item.url } : {}),
+				...(item?.favicon ? { favicon: item.favicon } : {}),
+			},
+		};
 	} catch (e) {
 		if (e instanceof Error && e.name === "AbortError") throw e;
-		await debugLog("tavily.extract_failed", { url, error: e instanceof Error ? e.message : String(e) });
+		await debugLog("tavily.extract_failed", { url, format, error: e instanceof Error ? e.message : String(e) });
 		return null;
 	}
 }
@@ -1771,10 +1820,13 @@ async function firecrawlSearch(
 
 async function firecrawlScrape(
 	url: string,
+	format: WebFetchFormat = "markdown",
 	signal?: AbortSignal,
-): Promise<string | null> {
+): Promise<WebFetchResult | null> {
 	const config = await configManager.getFullConfig();
 	if (!config.firecrawlApiKey) return null;
+	const firecrawlFormat = firecrawlFormatForWebFetch(format);
+	if (!firecrawlFormat) return null;
 
 	for (let attempt = 0; attempt < 3; attempt++) {
 		try {
@@ -1788,7 +1840,7 @@ async function firecrawlScrape(
 					},
 					body: JSON.stringify({
 						url,
-						formats: ["markdown"],
+						formats: [firecrawlFormat],
 						timeout: 60000,
 						waitFor: (attempt + 1) * 1500,
 					}),
@@ -1797,16 +1849,27 @@ async function firecrawlScrape(
 			);
 
 			const data = (await response.json()) as {
-				data?: { markdown?: string };
+				data?: Record<string, unknown> & { metadata?: Record<string, unknown> };
 			};
 
-			const md = data.data?.markdown;
-			if (md?.trim()) return md;
-			await debugLog("firecrawl.scrape_empty", { url, attempt: attempt + 1 });
+			const scraped = data.data;
+			const content = typeof scraped?.[firecrawlFormat] === "string"
+				? (scraped[firecrawlFormat] as string).trim()
+				: "";
+			if (content) {
+				return {
+					content,
+					provider: "firecrawl",
+					format,
+					metadata: firecrawlMetadata(url, scraped?.metadata),
+				};
+			}
+			await debugLog("firecrawl.scrape_empty", { url, format, attempt: attempt + 1 });
 		} catch (e) {
 			if (e instanceof Error && e.name === "AbortError") throw e;
 			await debugLog("firecrawl.scrape_failed", {
 				url,
+				format,
 				attempt: attempt + 1,
 				error: e instanceof Error ? e.message : String(e),
 			});
@@ -1814,6 +1877,505 @@ async function firecrawlScrape(
 	}
 
 	return null;
+}
+
+function firecrawlFormatForWebFetch(format: WebFetchFormat): "markdown" | "html" | "rawHtml" | null {
+	if (format === "markdown" || format === "html") return format;
+	if (format === "raw") return "rawHtml";
+	return null;
+}
+
+function firecrawlMetadata(url: string, metadata: Record<string, unknown> | undefined): WebFetchMetadata {
+	return {
+		url,
+		...stringField(metadata, "sourceURL", "finalUrl"),
+		...stringField(metadata, "url", "finalUrl"),
+		...numberField(metadata, "statusCode", "status"),
+		...stringField(metadata, "contentType", "contentType"),
+		...stringField(metadata, "title", "title"),
+		...stringField(metadata, "description", "description"),
+		...stringField(metadata, "language", "language"),
+	};
+}
+
+function stringField<T extends keyof WebFetchMetadata>(
+	record: Record<string, unknown> | undefined,
+	from: string,
+	to: T,
+): Partial<WebFetchMetadata> {
+	const value = record?.[from];
+	return typeof value === "string" && value.trim()
+		? ({ [to]: value.trim() } as Partial<WebFetchMetadata>)
+		: {};
+}
+
+function numberField<T extends keyof WebFetchMetadata>(
+	record: Record<string, unknown> | undefined,
+	from: string,
+	to: T,
+): Partial<WebFetchMetadata> {
+	const value = record?.[from];
+	return typeof value === "number" && Number.isFinite(value)
+		? ({ [to]: value } as Partial<WebFetchMetadata>)
+		: {};
+}
+
+function normalizeWebFetchFormat(value: unknown): WebFetchFormat {
+	return WEB_FETCH_FORMAT_VALUES.includes(value as WebFetchFormat)
+		? (value as WebFetchFormat)
+		: "markdown";
+}
+
+function normalizeHttpUrl(value: string): string {
+	const url = new URL(value);
+	if (url.protocol !== "http:" && url.protocol !== "https:") {
+		throw new Error("web_fetch 只支持 HTTP/HTTPS URL");
+	}
+	return url.href;
+}
+
+async function directFetch(
+	url: string,
+	format: WebFetchFormat,
+	maxOutputBytes: number,
+	signal?: AbortSignal,
+	redirectDepth = 0,
+	seen = new Set<string>(),
+): Promise<WebFetchResult | null> {
+	const targetUrl = normalizeHttpUrl(url);
+	if (seen.has(targetUrl)) return null;
+	seen.add(targetUrl);
+
+	try {
+		const response = await fetch(targetUrl, {
+			headers: directFetchHeaders(),
+			redirect: "follow",
+			signal: createTimeoutSignal(DEFAULT_REQUEST_TIMEOUT_MS, signal),
+		});
+		const metadata = metadataFromResponse(targetUrl, response);
+		if (!isTextLikeContent(metadata.contentType)) {
+			return {
+				content: noBodyNotice(metadata, "目标看起来是二进制或附件，未把正文注入上下文。"),
+				provider: "direct",
+				format,
+				metadata,
+			};
+		}
+		if (isLargeBody(metadata)) {
+			return {
+				content: noBodyNotice(metadata, "目标正文过大，未把正文注入上下文。请缩小 URL 范围或明确提高预算后重试。"),
+				provider: "direct",
+				format,
+				metadata,
+			};
+		}
+
+		const inputLimit = Math.min(
+			Math.max(maxOutputBytes * 4, DIRECT_FETCH_MIN_INPUT_BYTES),
+			DIRECT_FETCH_MAX_INPUT_BYTES,
+		);
+		const body = await readTextPreview(response, inputLimit);
+		let content = body.text.trim();
+		if (!content) return {
+			content: noBodyNotice(metadata, "目标响应没有可注入的文本正文。"),
+			provider: "direct",
+			format,
+			metadata,
+		};
+
+		const html = isHtmlContent(metadata.contentType, content);
+		if (html) {
+			Object.assign(metadata, extractHtmlMetadata(content, metadata.finalUrl || targetUrl));
+			if (redirectDepth < 2) {
+				const refreshUrl = findMetaRefreshUrl(content, metadata.finalUrl || targetUrl);
+				if (refreshUrl && !seen.has(refreshUrl)) {
+					return directFetch(refreshUrl, format, maxOutputBytes, signal, redirectDepth + 1, seen);
+				}
+			}
+
+			if (format !== "raw" && redirectDepth < 2) {
+				const readable = htmlToReadableText(content);
+				if (readable.length < 500) {
+					const alternateUrl = findAlternateUrl(content, metadata.finalUrl || targetUrl, format);
+					if (alternateUrl && !seen.has(alternateUrl)) {
+						return directFetch(alternateUrl, format, maxOutputBytes, signal, redirectDepth + 1, seen);
+					}
+				}
+			}
+		}
+
+		content = renderDirectContent(content, format, metadata, body.truncated, inputLimit);
+		return { content, provider: "direct", format, metadata };
+	} catch (e) {
+		if (e instanceof Error && e.name === "AbortError") throw e;
+		await debugLog("direct.fetch_failed", {
+			url,
+			format,
+			error: e instanceof Error ? e.message : String(e),
+		});
+		return null;
+	}
+}
+
+function directFetchHeaders(): Record<string, string> {
+	return {
+		"User-Agent":
+			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+		Accept:
+			"text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,text/plain;q=0.8,*/*;q=0.5",
+		"Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+		"Cache-Control": "no-cache",
+		Pragma: "no-cache",
+	};
+}
+
+function metadataFromResponse(url: string, response: Response): WebFetchMetadata {
+	const contentLength = parseContentLength(response.headers.get("content-length"));
+	const contentType = response.headers.get("content-type") || undefined;
+	const contentDisposition = response.headers.get("content-disposition") || undefined;
+	return {
+		url,
+		...(response.url ? { finalUrl: response.url } : {}),
+		status: response.status,
+		...(contentType ? { contentType } : {}),
+		...(contentDisposition ? { contentDisposition } : {}),
+		...(contentLength !== null ? { contentLength } : {}),
+	};
+}
+
+function parseContentLength(value: string | null): number | null {
+	if (!value) return null;
+	const parsed = Number(value);
+	return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function isTextLikeContent(contentType: string | undefined): boolean {
+	if (!contentType) return true;
+	const type = contentType.toLowerCase();
+	return (
+		type.startsWith("text/") ||
+		type.includes("json") ||
+		type.includes("xml") ||
+		type.includes("javascript") ||
+		type.includes("typescript") ||
+		type.includes("markdown") ||
+		type.includes("yaml") ||
+		type.includes("x-www-form-urlencoded") ||
+		type.includes("svg")
+	);
+}
+
+function isLargeBody(metadata: WebFetchMetadata): boolean {
+	return (
+		(metadata.contentLength !== undefined && metadata.contentLength > DIRECT_FETCH_LARGE_BODY_BYTES) ||
+		!!metadata.contentDisposition?.toLowerCase().includes("attachment")
+	);
+}
+
+function isHtmlContent(contentType: string | undefined, content: string): boolean {
+	return !!contentType?.toLowerCase().includes("html") || /^\s*<!doctype html/i.test(content) || /^\s*<html[\s>]/i.test(content);
+}
+
+async function readTextPreview(response: Response, maxBytes: number): Promise<{ text: string; truncated: boolean }> {
+	const reader = response.body?.getReader();
+	if (!reader) return { text: await response.text(), truncated: false };
+
+	const decoder = new TextDecoder();
+	let text = "";
+	let bytes = 0;
+	let truncated = false;
+
+	while (true) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		if (!value) continue;
+		const remaining = maxBytes - bytes;
+		if (remaining <= 0) {
+			truncated = true;
+			await reader.cancel().catch(() => undefined);
+			break;
+		}
+		const chunk = value.byteLength > remaining ? value.slice(0, remaining) : value;
+		text += decoder.decode(chunk, { stream: true });
+		bytes += chunk.byteLength;
+		if (value.byteLength > remaining) {
+			truncated = true;
+			await reader.cancel().catch(() => undefined);
+			break;
+		}
+	}
+
+	text += decoder.decode();
+	return { text, truncated };
+}
+
+function noBodyNotice(metadata: WebFetchMetadata, reason: string): string {
+	const lines = [`## 未注入正文`, "", reason, ""];
+	lines.push(`- URL: ${metadata.finalUrl || metadata.url}`);
+	if (metadata.status) lines.push(`- Status: ${metadata.status}`);
+	if (metadata.contentType) lines.push(`- Content-Type: ${metadata.contentType}`);
+	if (metadata.contentLength !== undefined) lines.push(`- Content-Length: ${formatSize(metadata.contentLength)}`);
+	if (metadata.contentDisposition) lines.push(`- Content-Disposition: ${metadata.contentDisposition}`);
+	return lines.join("\n");
+}
+
+function renderDirectContent(
+	content: string,
+	format: WebFetchFormat,
+	metadata: WebFetchMetadata,
+	inputTruncated: boolean,
+	inputLimit: number,
+): string {
+	const html = isHtmlContent(metadata.contentType, content);
+	let output = content;
+	if (format === "markdown") {
+		output = html ? htmlToMarkdownPreview(content, metadata) : content;
+	} else if (format === "text") {
+		output = html ? htmlToReadableText(content) : content;
+	} else if (format === "json") {
+		output = prettyJsonOrText(content);
+	}
+	if (inputTruncated) {
+		output += `\n\n[Direct fetch input truncated at ${formatSize(inputLimit)} before formatting.]`;
+	}
+	return output.trim();
+}
+
+function prettyJsonOrText(content: string): string {
+	try {
+		return JSON.stringify(JSON.parse(content), null, 2);
+	} catch {
+		return content;
+	}
+}
+
+function htmlToMarkdownPreview(html: string, metadata: WebFetchMetadata): string {
+	const text = htmlToReadableText(html);
+	if (!metadata.title) return text;
+	return `# ${metadata.title}\n\n${text.replace(new RegExp(`^${escapeRegExp(metadata.title)}\\s*`), "").trim()}`.trim();
+}
+
+function htmlToReadableText(html: string): string {
+	return decodeHtmlEntities(
+		html
+			.replace(/<script\b[\s\S]*?<\/script>/gi, "\n")
+			.replace(/<style\b[\s\S]*?<\/style>/gi, "\n")
+			.replace(/<!--[\s\S]*?-->/g, "\n")
+			.replace(/<(?:br|hr)\s*\/?>/gi, "\n")
+			.replace(/<\/(?:p|div|section|article|header|footer|main|nav|aside|li|h[1-6]|tr)>/gi, "\n")
+			.replace(/<[^>]+>/g, " ")
+	)
+		.split(/\r?\n/)
+		.map((line) => line.replace(/[ \t]+/g, " ").trim())
+		.filter(Boolean)
+		.join("\n");
+}
+
+function extractHtmlMetadata(html: string, baseUrl: string): Partial<WebFetchMetadata> {
+	return {
+		...firstHtmlMatch(html, /<title[^>]*>([\s\S]*?)<\/title>/i, "title"),
+		...metaContent(html, "description", "description"),
+		...metaContent(html, "og:description", "description"),
+		...linkHref(html, "canonical", "canonicalUrl", baseUrl),
+		...htmlLang(html),
+	};
+}
+
+function firstHtmlMatch<T extends keyof WebFetchMetadata>(html: string, pattern: RegExp, key: T): Partial<WebFetchMetadata> {
+	const value = html.match(pattern)?.[1];
+	return value?.trim()
+		? ({ [key]: decodeHtmlEntities(value.replace(/<[^>]+>/g, " ").trim()) } as Partial<WebFetchMetadata>)
+		: {};
+}
+
+function metaContent<T extends keyof WebFetchMetadata>(html: string, name: string, key: T): Partial<WebFetchMetadata> {
+	for (const tag of html.matchAll(/<meta\b[^>]*>/gi)) {
+		const attrs = parseHtmlAttributes(tag[0]);
+		const attrName = (attrs.name || attrs.property || "").toLowerCase();
+		if (attrName === name.toLowerCase() && attrs.content?.trim()) {
+			return { [key]: decodeHtmlEntities(attrs.content.trim()) } as Partial<WebFetchMetadata>;
+		}
+	}
+	return {};
+}
+
+function linkHref<T extends keyof WebFetchMetadata>(html: string, rel: string, key: T, baseUrl: string): Partial<WebFetchMetadata> {
+	for (const tag of html.matchAll(/<link\b[^>]*>/gi)) {
+		const attrs = parseHtmlAttributes(tag[0]);
+		const rels = (attrs.rel || "").toLowerCase().split(/\s+/);
+		if (rels.includes(rel.toLowerCase()) && attrs.href?.trim()) {
+			try {
+				return { [key]: new URL(attrs.href.trim(), baseUrl).href } as Partial<WebFetchMetadata>;
+			} catch {
+				continue;
+			}
+		}
+	}
+	return {};
+}
+
+function htmlLang(html: string): Partial<WebFetchMetadata> {
+	const match = html.match(/<html\b[^>]*\blang=["']?([^"'\s>]+)/i);
+	return match?.[1] ? { language: match[1] } : {};
+}
+
+function findMetaRefreshUrl(html: string, baseUrl: string): string | null {
+	for (const tag of html.matchAll(/<meta\b[^>]*>/gi)) {
+		const attrs = parseHtmlAttributes(tag[0]);
+		if ((attrs["http-equiv"] || "").toLowerCase() !== "refresh") continue;
+		const content = attrs.content || "";
+		const delay = Number(content.split(";")[0]?.trim() || "0");
+		if (Number.isFinite(delay) && delay > 5) continue;
+		const urlMatch = content.match(/url\s*=\s*([^;]+)/i);
+		const refreshUrl = urlMatch?.[1]?.trim().replace(/^['"]|['"]$/g, "");
+		if (!refreshUrl) continue;
+		try {
+			return normalizeHttpUrl(new URL(refreshUrl, baseUrl).href);
+		} catch {
+			continue;
+		}
+	}
+	return null;
+}
+
+function findAlternateUrl(html: string, baseUrl: string, format: WebFetchFormat): string | null {
+	const acceptedTypes: Record<WebFetchFormat, string[]> = {
+		markdown: ["text/markdown", "text/x-markdown", "text/plain"],
+		text: ["text/plain"],
+		html: ["text/html", "application/xhtml+xml"],
+		json: ["application/json"],
+		raw: [],
+	};
+	const accepted = acceptedTypes[format];
+	if (accepted.length === 0) return null;
+	for (const tag of html.matchAll(/<link\b[^>]*>/gi)) {
+		const attrs = parseHtmlAttributes(tag[0]);
+		const rels = (attrs.rel || "").toLowerCase().split(/\s+/);
+		const type = (attrs.type || "").toLowerCase().split(";")[0].trim();
+		if (!rels.includes("alternate") || !accepted.includes(type) || !attrs.href?.trim()) continue;
+		try {
+			return normalizeHttpUrl(new URL(attrs.href.trim(), baseUrl).href);
+		} catch {
+			continue;
+		}
+	}
+	return null;
+}
+
+function parseHtmlAttributes(tag: string): Record<string, string> {
+	const attrs: Record<string, string> = {};
+	for (const match of tag.matchAll(/([\w:-]+)(?:\s*=\s*("[^"]*"|'[^']*'|[^\s"'>]+))?/g)) {
+		const name = match[1]?.toLowerCase();
+		if (!name) continue;
+		const raw = match[2] || "";
+		attrs[name] = decodeHtmlEntities(raw.replace(/^['"]|['"]$/g, ""));
+	}
+	return attrs;
+}
+
+function decodeHtmlEntities(text: string): string {
+	const named: Record<string, string> = {
+		amp: "&",
+		lt: "<",
+		gt: ">",
+		quot: '"',
+		apos: "'",
+		nbsp: " ",
+	};
+	return text.replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (match, entity: string) => {
+		const lower = entity.toLowerCase();
+		if (lower[0] === "#") {
+			const code = lower[1] === "x" ? Number.parseInt(lower.slice(2), 16) : Number.parseInt(lower.slice(1), 10);
+			return Number.isFinite(code) ? String.fromCodePoint(code) : match;
+		}
+		return named[lower] || match;
+	});
+}
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function parseJsonContent(content: string): unknown {
+	try {
+		return JSON.parse(content);
+	} catch {
+		return content;
+	}
+}
+
+async function finishWebFetchResult(
+	result: WebFetchResult,
+	maxOutputBytes: number,
+): Promise<{ content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> }> {
+	if (result.format === "json") return finishJsonWebFetchResult(result, maxOutputBytes);
+
+	const output = await truncateToolOutput(result.content, `web-fetch-${result.provider}`, {
+		maxBytes: maxOutputBytes,
+		extension: extensionForOutputFormat(result.format),
+	});
+	const { content, ...outputDetails } = output;
+	return {
+		content: [{ type: "text", text: content }],
+		details: webFetchDetails(result, outputDetails),
+	};
+}
+
+async function finishJsonWebFetchResult(
+	result: WebFetchResult,
+	maxOutputBytes: number,
+): Promise<{ content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> }> {
+	const overhead = JSON.stringify({
+		url: result.metadata.url,
+		final_url: result.metadata.finalUrl,
+		provider: result.provider,
+		format: result.format,
+		metadata: result.metadata,
+		content: "",
+		truncated: false,
+		full_output_path: undefined,
+	}, null, 2);
+	const contentBudget = Math.max(1000, maxOutputBytes - Buffer.byteLength(overhead, "utf8") - 200);
+	const truncatedContent = truncateText(result.content, { maxBytes: contentBudget });
+	const fullOutputPath = truncatedContent.truncated
+		? await saveFullOutput(`web-fetch-${result.provider}`, result.content, "json")
+		: null;
+	const payload = {
+		url: result.metadata.url,
+		final_url: result.metadata.finalUrl,
+		provider: result.provider,
+		format: result.format,
+		metadata: result.metadata,
+		content: parseJsonContent(truncatedContent.content),
+		truncated: truncatedContent.truncated,
+		output_bytes: truncatedContent.outputBytes,
+		total_bytes: truncatedContent.totalBytes,
+		output_lines: truncatedContent.outputLines,
+		total_lines: truncatedContent.totalLines,
+		...(fullOutputPath ? { full_output_path: fullOutputPath } : {}),
+	};
+	return {
+		content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+		details: webFetchDetails(result, {
+			truncated: truncatedContent.truncated,
+			fullOutputPath: fullOutputPath || undefined,
+			outputBytes: truncatedContent.outputBytes,
+			totalBytes: truncatedContent.totalBytes,
+			outputLines: truncatedContent.outputLines,
+			totalLines: truncatedContent.totalLines,
+		}),
+	};
+}
+
+function webFetchDetails(result: WebFetchResult, outputDetails: Record<string, unknown>): Record<string, unknown> {
+	return {
+		url: result.metadata.url,
+		final_url: result.metadata.finalUrl,
+		provider: result.provider,
+		format: result.format,
+		metadata: result.metadata,
+		...outputDetails,
+	};
 }
 
 // =============================================================================
@@ -1885,7 +2447,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (_event, _ctx) => {
 		const config = await configManager.getFullConfig();
 		return {
-			systemPrompt: `${_event.systemPrompt}\n\n${SEARCH_PROFILE_DEFS[config.searchProfile].lightPrompt}`,
+			systemPrompt: `${_event.systemPrompt}\n\n${SEARCH_PROFILE_DEFS[config.searchProfile].lightPrompt}\n${WEB_FETCH_LIGHT_PROMPT}`,
 		};
 	});
 
@@ -2164,22 +2726,32 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// =========================================================================
-	// Tool: web_fetch — 网页内容抓取（Tavily → Firecrawl 自动降级）
+	// Tool: web_fetch — 网页内容抓取（Tavily → Firecrawl → direct 自动降级）
 	// =========================================================================
 	pi.registerTool({
 		name: "web_fetch",
 		label: "Web Fetch",
 		description:
-			"抓取并提取指定 URL 的网页内容，返回 Markdown 预览。\n" +
-			"优先使用 Tavily Extract，失败时自动降级到 Firecrawl Scrape。\n" +
-			"默认限制返回大小，避免把网页全文注入上下文。",
-		promptSnippet: "抓取网页内容预览（Tavily → Firecrawl 自动降级）",
+			"独立抓取一个明确的 HTTP/HTTPS URL，并返回受输出预算保护的页面/API 预览。\n" +
+			"默认 format=markdown；markdown/text 优先使用 Tavily Extract，markdown/html/raw 可降级到 Firecrawl Scrape，最后使用带常见浏览器请求头的 direct fetch。\n" +
+			"可独立用于用户给定 URL，也可作为 grok_search 后检查选中信源的后续工具；不执行 JavaScript，不处理登录会话，也不是批量下载器。",
+		promptSnippet: "独立抓取指定 URL 预览；也可检查 grok_search 选中信源",
 		promptGuidelines: [
-			"Use web_fetch to preview content from a specific webpage URL.",
-			"Use web_fetch after grok_search to inspect selected result URLs; increase max_output_bytes only when the user needs more detail.",
+			"Use web_fetch directly when the user provides a concrete HTTP(S) URL and asks to read, inspect, summarize, verify, or debug that page/API response.",
+			"Keep the existing search flow: when the URL is unknown, use grok_search first, then web_fetch only for selected high-value source URLs that need inspection.",
+			"Default to format=markdown for readable page previews. Use format=text for plain text, html for cleaned/source HTML inspection, json for API payloads or structured metadata, and raw only for bounded raw-body/rawHtml debugging.",
+			"Use returned details.metadata for status, final URL, content type, content length, title, description, canonical URL, and binary/large-file decisions.",
+			"Do not treat web_fetch as a browser, JavaScript renderer, login/session tool, bulk downloader, or anti-bot bypass; large/binary targets should be summarized by metadata instead of injected.",
+			"Respect the context budget: fetch one URL at a time, avoid raw/html unless needed, and increase max_output_bytes only when the user explicitly needs more content.",
+			"If extraction is thin, truncated, blocked, or mismatched, report that limitation and switch back to grok_search or a narrower URL instead of repeatedly fetching broad pages.",
 		],
 		parameters: Type.Object({
 			url: Type.String({ description: "要抓取的网页 URL（HTTP/HTTPS）" }),
+			format: Type.Optional(
+				StringEnum(WEB_FETCH_FORMAT_VALUES, {
+					description: "输出格式。默认 markdown；html/raw/json 仅在需要源码、接口载荷或排错时使用。",
+				}),
+			),
 			max_output_bytes: Type.Optional(
 				Type.Number({ description: "返回内容最大字节数，默认 12000", minimum: 3000, maximum: 51200 }),
 			),
@@ -2188,64 +2760,53 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const config = await configManager.getFullConfig();
 			const maxOutputBytes = clampNumber(params.max_output_bytes, 12000, 3000, 50 * 1024);
+			const format = normalizeWebFetchFormat(params.format);
+			let url: string;
+			try {
+				url = normalizeHttpUrl(params.url);
+			} catch (e) {
+				return {
+					content: [{ type: "text", text: `URL 错误: ${e instanceof Error ? e.message : String(e)}` }],
+					details: { url: params.url, format, error: "invalid_url" },
+				};
+			}
 			const endStatus = beginStatus(ctx, formatGrokStatus(config.grokModel));
-			onUpdate?.({ content: [{ type: "text", text: "📄 正在抓取网页..." }], details: {} });
+			onUpdate?.({ content: [{ type: "text", text: `📄 正在抓取网页 (${format})...` }], details: {} });
 
 			try {
-
-				// Try Tavily first
 				if (config.tavilyApiKey) {
-					const result = await tavilyExtract(params.url, signal);
-					if (result) {
-						const output = await truncateToolOutput(result, "web-fetch-tavily", { maxBytes: maxOutputBytes });
-						const { content, ...outputDetails } = output;
-						return {
-							content: [{ type: "text", text: content }],
-							details: { url: params.url, provider: "tavily", ...outputDetails },
-						};
-					}
+					const result = await tavilyExtract(url, format, signal);
+					if (result) return finishWebFetchResult(result, maxOutputBytes);
 				}
 
-				// Fallback to Firecrawl
 				if (config.firecrawlApiKey) {
 					onUpdate?.({
-						content: [
-							{ type: "text", text: "📄 Tavily 失败，尝试 Firecrawl..." },
-						],
+						content: [{ type: "text", text: "📄 Tavily 不适用或失败，尝试 Firecrawl..." }],
 						details: {},
 					});
-					const result = await firecrawlScrape(params.url, signal);
-					if (result) {
-						const output = await truncateToolOutput(result, "web-fetch-firecrawl", { maxBytes: maxOutputBytes });
-						const { content, ...outputDetails } = output;
-						return {
-							content: [{ type: "text", text: content }],
-							details: { url: params.url, provider: "firecrawl", ...outputDetails },
-						};
-					}
+					const result = await firecrawlScrape(url, format, signal);
+					if (result) return finishWebFetchResult(result, maxOutputBytes);
 				}
 
-				// Both failed or not configured
-				if (!config.tavilyApiKey && !config.firecrawlApiKey) {
-					return {
-						content: [
-							{
-								type: "text",
-								text: "配置错误: TAVILY_API_KEY 和 FIRECRAWL_API_KEY 均未配置。\n请使用 /grok-config 设置至少一个。",
-							},
-						],
-						details: { url: params.url, error: "not_configured" },
-					};
-				}
+				onUpdate?.({
+					content: [{ type: "text", text: "📄 提取服务不适用或失败，尝试 direct fetch..." }],
+					details: {},
+				});
+				const directResult = await directFetch(url, format, maxOutputBytes, signal);
+				if (directResult) return finishWebFetchResult(directResult, maxOutputBytes);
 
 				return {
 					content: [
 						{
 							type: "text",
-							text: "提取失败: 所有提取服务均未能获取内容。可尝试用 grok_search 搜索相关内容。",
+							text: "提取失败: Tavily/Firecrawl/direct fetch 均未能获取可注入的文本内容。可尝试用 grok_search 搜索相关内容。",
 						},
 					],
-					details: { url: params.url, error: "all_failed" },
+					details: {
+						url,
+						format,
+						error: !config.tavilyApiKey && !config.firecrawlApiKey ? "direct_failed_no_extractors_configured" : "all_failed",
+					},
 				};
 			} finally {
 				endStatus();
@@ -2399,7 +2960,7 @@ export default function (pi: ExtensionAPI) {
 				// Test Firecrawl
 				if (config.firecrawlApiKey) {
 					try {
-						await firecrawlScrape("https://example.com");
+						await firecrawlScrape("https://example.com", "markdown");
 						results.push("✅ **Firecrawl API**: 连接成功");
 					} catch (e) {
 						results.push(`❌ **Firecrawl API**: ${e instanceof Error ? e.message : "连接失败"}`);

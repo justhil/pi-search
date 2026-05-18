@@ -14,7 +14,7 @@
 pi ──Extension──► pi-grok-search
                     ├─ grok_search     ───► Grok API（AI 深度搜索）
                     ├─ grok_sources    ───► 信源缓存（按 session_id）
-                    ├─ web_fetch       ───► Tavily Extract → Firecrawl Scrape（自动降级）
+                    ├─ web_fetch       ───► Tavily Extract → Firecrawl Scrape → Direct Fetch（自动降级）
                     ├─ web_map         ───► Tavily Map（站点映射）
                     └─ search_planning ──► 6 阶段结构化搜索规划
 ```
@@ -23,7 +23,7 @@ pi ──Extension──► pi-grok-search
 
 - **🔍 AI 深度搜索** — Grok 驱动，自动时间注入，支持平台聚焦，默认紧凑输出
 - **🎛️ 搜索模式预设** — `/grok-config` 中切换 Auto / 编程文档 / 代码示例 / 项目调研 / 论文资料 / 事实核查
-- **📄 网页抓取** — Tavily Extract → Firecrawl Scrape 自动降级，默认返回预览避免上下文爆炸
+- **📄 网页抓取** — Tavily Extract → Firecrawl Scrape → Direct Fetch 自动降级，支持 `markdown/text/html/json/raw` 与轻量 metadata，默认返回预览避免上下文爆炸
 - **🗺️ 站点映射** — Tavily Map 遍历网站结构，默认限制链接与输出大小
 - **📋 搜索规划** — 6 阶段结构化规划
 - **💾 信源缓存** — session_id 索引，按需获取
@@ -71,10 +71,10 @@ export GROK_API_URL="https://api.x.ai/v1"
 export GROK_API_KEY="xai-your-key"
 export GROK_MODEL="grok-4-fast"        # 可选
 
-# Tavily（可选，提供 web_fetch / web_map）
+# Tavily（可选，增强 web_fetch 并提供 web_map）
 export TAVILY_API_KEY="tvly-your-key"
 
-# Firecrawl（可选，Tavily 失败时托底）
+# Firecrawl（可选，web_fetch 提取托底）
 export FIRECRAWL_API_KEY="fc-your-key"
 ```
 
@@ -120,12 +120,34 @@ export FIRECRAWL_API_KEY="fc-your-key"
 | ----------------- | ------------------------------------------- |
 | `grok_search`     | AI 深度搜索，默认 compact 输出，返回结果 + session_id |
 | `grok_sources`    | 通过 session_id 分页获取信源列表                    |
-| `web_fetch`       | 抓取网页内容预览（Tavily → Firecrawl 自动降级）      |
+| `web_fetch`       | 抓取网页内容预览（Tavily → Firecrawl → direct 自动降级，多格式） |
 | `web_map`         | 遍历网站结构，生成受限站点地图                      |
 | `grok_config`     | 查看/修改/测试配置                          |
 | `search_planning` | 6 阶段结构化搜索规划                        |
 
 安装后 LLM 会自动识别这些工具，根据用户问题自主决定调用。
+
+### `web_fetch` 与 pi-smart-fetch 的差异
+
+[`pi-smart-fetch`](https://pi.dev/packages/pi-smart-fetch) 是专门的抓取插件，重点在浏览器级 TLS/HTTP 指纹、Defuddle 正文抽取、批量抓取、附件/大文件下载、站点特化清洗等能力。
+
+本扩展的 `web_fetch` 仍以搜索工作流中的“按需 URL 预览”为边界，保持无额外依赖和低上下文占用：
+
+- 默认链路：`Tavily Extract` → `Firecrawl Scrape` → `direct fetch`；direct fetch 只使用常见浏览器请求头，不承诺真实 TLS 指纹或 JS 渲染
+- 支持格式：`markdown`（默认）、`text`、`html`、`json`、`raw`；其中 `raw` 仍是受输出预算保护的原始正文/`rawHtml` 预览，不是完整响应转储
+- 返回 `details.metadata`：URL、最终 URL、状态码、Content-Type、Content-Length、Content-Disposition、标题、描述、canonical、语言等可用字段
+- direct fetch 会识别短延迟 `<meta http-equiv="refresh">`，并在正文过薄时尝试合格的 `<link rel="alternate" type="...">`
+- 可识别的大文件或二进制目标只返回元信息提示，不把正文注入上下文；不处理登录会话、验证码、JS 执行、批量下载
+
+示例参数：
+
+```json
+{
+  "url": "https://example.com/docs",
+  "format": "markdown",
+  "max_output_bytes": 12000
+}
+```
 
 ### 搜索模式预设
 
@@ -149,7 +171,7 @@ export FIRECRAWL_API_KEY="fc-your-key"
 - `grok_search` 默认 `mode=compact`，只返回紧凑答案和 Top 信源；明确需要深度研究时再用 `mode=deep`
 - `extra_sources` 是 Tavily/Firecrawl 共享的补充信源总预算，不会再被两个引擎叠加放大
 - `grok_sources` 支持 `limit` / `offset` 分页，默认每次 20 条
-- `web_fetch` 默认最多返回约 12KB 预览，可用 `max_output_bytes` 临时放大
+- `web_fetch` 默认 `format=markdown`，最多返回约 12KB 预览；即使未配置 Tavily/Firecrawl 也会尝试 direct fetch，可用 `format` / `max_output_bytes` 临时调整
 - `web_map` 默认 `max_breadth=10`、`limit=30`，并走统一输出截断
 
 常用参数：

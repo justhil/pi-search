@@ -14,7 +14,7 @@ Complete web access for [pi](https://github.com/earendil-works/pi-mono) powered 
 pi ──Extension──► pi-grok-search
                     ├─ grok_search     ───► Grok API (AI Deep Search)
                     ├─ grok_sources    ───► Source Cache (by session_id)
-                    ├─ web_fetch       ───► Tavily Extract → Firecrawl Scrape (auto-fallback)
+                    ├─ web_fetch       ───► Tavily Extract → Firecrawl Scrape → Direct Fetch (auto-fallback)
                     ├─ web_map         ───► Tavily Map (Site Mapping)
                     └─ search_planning ──► 6-Phase Structured Search Planning
 ```
@@ -23,7 +23,7 @@ pi ──Extension──► pi-grok-search
 
 - **🔍 AI Deep Search** — Grok-powered, auto time injection, platform focus, compact output by default
 - **🎛️ Search profiles** — Switch Auto / Coding Docs / Code Examples / Project Research / Academic / Fact Check in `/grok-config`
-- **📄 Web Fetch** — Tavily Extract → Firecrawl Scrape auto-fallback, preview output by default
+- **📄 Web Fetch** — Tavily Extract → Firecrawl Scrape → Direct Fetch auto-fallback, supports `markdown/text/html/json/raw` plus lightweight metadata, preview output by default
 - **🗺️ Site Mapping** — Tavily Map traverses website structure with conservative defaults
 - **📋 Search Planning** — 6-phase structured planning
 - **💾 Source Cache** — session_id indexed, on-demand retrieval
@@ -71,10 +71,10 @@ export GROK_API_URL="https://api.x.ai/v1"
 export GROK_API_KEY="xai-your-key"
 export GROK_MODEL="grok-4-fast"        # optional
 
-# Tavily (optional, provides web_fetch / web_map)
+# Tavily (optional, improves web_fetch and provides web_map)
 export TAVILY_API_KEY="tvly-your-key"
 
-# Firecrawl (optional, fallback when Tavily fails)
+# Firecrawl (optional, extraction fallback for web_fetch)
 export FIRECRAWL_API_KEY="fc-your-key"
 ```
 
@@ -120,12 +120,34 @@ Persisted to `~/.config/pi-grok-search/config.json`:
 | ----------------- | ---------------------------------------------------- |
 | `grok_search`     | AI search with compact default output + session_id      |
 | `grok_sources`    | Retrieve paginated source list by session_id            |
-| `web_fetch`       | Fetch web content preview (Tavily → Firecrawl fallback) |
+| `web_fetch`       | Fetch web content preview (Tavily → Firecrawl → direct fallback, multi-format) |
 | `web_map`         | Traverse website structure with bounded output          |
 | `grok_config`     | View / modify / test configuration                   |
 | `search_planning` | 6-phase structured search planning                   |
 
 After installation, LLM automatically recognizes these tools and decides when to call them.
+
+### `web_fetch` vs pi-smart-fetch
+
+[`pi-smart-fetch`](https://pi.dev/packages/pi-smart-fetch) is a dedicated fetch package focused on browser-like TLS/HTTP fingerprints, Defuddle extraction, batch fetch, attachment/large-file downloads, and site-specific cleanup.
+
+This extension keeps `web_fetch` scoped to targeted URL previews inside a search workflow, with no extra runtime dependencies and conservative context usage:
+
+- Default chain: `Tavily Extract` → `Firecrawl Scrape` → `direct fetch`; direct fetch only sends common browser headers and does not promise real TLS fingerprinting or JS rendering
+- Formats: `markdown` (default), `text`, `html`, `json`, `raw`; `raw` is still a budgeted raw body/`rawHtml` preview, not a full response dump
+- Returns `details.metadata`: URL, final URL, status, Content-Type, Content-Length, Content-Disposition, title, description, canonical URL, language, and other available fields
+- direct fetch follows short-delay `<meta http-equiv="refresh">` redirects and can try qualified `<link rel="alternate" type="...">` entries when the extracted body is thin
+- Detectable large or binary targets return metadata instead of injecting bodies; login sessions, CAPTCHA, JavaScript execution, and bulk downloads are out of scope
+
+Example parameters:
+
+```json
+{
+  "url": "https://example.com/docs",
+  "format": "markdown",
+  "max_output_bytes": 12000
+}
+```
 
 ### Search Profiles
 
@@ -149,7 +171,7 @@ To avoid context blow-ups, conservative budgets are enabled by default:
 - `grok_search` defaults to `mode=compact`; use `mode=deep` only for explicit deep-research requests
 - `extra_sources` is a shared Tavily/Firecrawl source budget, not a per-provider multiplier
 - `grok_sources` supports `limit` / `offset` pagination and defaults to 20 sources per call
-- `web_fetch` returns an approximately 12KB preview by default; use `max_output_bytes` to enlarge one call
+- `web_fetch` defaults to `format=markdown` and returns an approximately 12KB preview; it still tries direct fetch without Tavily/Firecrawl, and `format` / `max_output_bytes` can adjust one call
 - `web_map` defaults to `max_breadth=10`, `limit=30`, and uses the shared output truncation path
 
 Common parameters:
