@@ -774,10 +774,12 @@ function pushCacheAttempt(attempts: ProviderAttempt[], provider: string, ok = tr
 }
 
 function context7SnippetsFromData(data: unknown): unknown[] {
+	if (typeof data === "string") return data.trim() ? [data] : [];
 	if (!isRecord(data)) return [];
 	const code = Array.isArray(data.codeSnippets) ? data.codeSnippets : [];
 	const info = Array.isArray(data.infoSnippets) ? data.infoSnippets : [];
-	return [...code, ...info];
+	const content = typeof data.content === "string" && data.content.trim() ? [data.content] : [];
+	return [...code, ...info, ...content];
 }
 
 async function getContext7LibrariesCached(
@@ -2385,7 +2387,13 @@ async function context7DocsRaw(
 			signal: createTimeoutSignal(DEFAULT_REQUEST_TIMEOUT_MS, signal),
 		},
 	);
-	return response.json().catch(async () => ({ content: await response.text() })) as Promise<unknown>;
+	const body = await response.text();
+	if (!body.trim()) return {};
+	try {
+		return JSON.parse(body) as unknown;
+	} catch {
+		return { content: body };
+	}
 }
 
 async function context7Docs(
@@ -2400,6 +2408,53 @@ function context7LibraryUrl(baseUrl: string, id: string | undefined): string {
 	if (!id) return baseUrl.replace(/\/+$/, "");
 	if (/^https?:\/\//.test(id)) return id;
 	return `${baseUrl.replace(/\/+$/, "")}/${id.replace(/^\/+/, "")}`;
+}
+
+function normalizeContext7MatchText(value: string | undefined): string {
+	return (value || "").toLowerCase().replace(/^@/, "").replace(/[^a-z0-9]+/g, "");
+}
+
+function context7LibraryScore(item: Context7LibraryItem, libraryName: string, query?: string): number {
+	const wanted = normalizeContext7MatchText(libraryName);
+	if (!wanted) return 0;
+	const title = normalizeContext7MatchText(item.title);
+	const description = normalizeContext7MatchText(item.description);
+	const rawText = `${item.id || ""} ${item.title || ""} ${item.description || ""}`.toLowerCase();
+	const idSegments = (item.id || "").split("/").filter(Boolean).map(normalizeContext7MatchText);
+	let score = 0;
+
+	if (/official.*documentation|documentation.*official|official docs|react\.dev/.test(rawText)) score += 260;
+	if (rawText.includes("react.dev")) score += 120;
+	if (title === wanted) score += 240;
+	if (idSegments.some((segment) => segment === wanted)) score += 220;
+	if (idSegments.length >= 2 && idSegments[idSegments.length - 1] === wanted) score += 40;
+	if (title.startsWith(wanted)) score += 50;
+	if (title.includes(wanted)) score += 20;
+	if (description.includes(wanted)) score += 8;
+	if (/official|documentation|docs/.test(`${item.description || ""} ${item.title || ""}`.toLowerCase())) score += 10;
+	if (query) {
+		for (const term of query.toLowerCase().split(/\W+/).filter((term) => term.length > 2)) {
+			const normalizedTerm = normalizeContext7MatchText(term);
+			if (title.includes(normalizedTerm)) score += 2;
+			if (description.includes(normalizedTerm)) score += 1;
+		}
+	}
+	if (item.trustScore !== undefined) score += item.trustScore * 2;
+	if (item.benchmarkScore !== undefined) score += item.benchmarkScore / 2;
+	if (item.totalSnippets !== undefined) score += Math.min(30, Math.log10(Math.max(1, item.totalSnippets)) * 8);
+	if (item.stars !== undefined) score += Math.min(20, Math.log10(Math.max(1, item.stars)) * 4);
+
+	return score;
+}
+
+function selectContext7Library(
+	libraries: Context7LibraryItem[],
+	libraryName: string,
+	query?: string,
+): Context7LibraryItem | undefined {
+	return libraries
+		.filter((item) => item.id)
+		.sort((a, b) => context7LibraryScore(b, libraryName, query) - context7LibraryScore(a, libraryName, query))[0] || libraries[0];
 }
 
 function context7LibrarySources(items: Context7LibraryItem[], baseUrl: string): Source[] {
@@ -3908,10 +3963,10 @@ export default function (pi: ExtensionAPI) {
 			const endStatus = beginStatus(ctx, "Context7 Resolve");
 			try {
 				const maxResults = clampNumber(params.max_results, 8, 1, 20);
-				const searchQuery = params.query ? `${params.libraryName} ${params.query}` : params.libraryName;
+				const searchQuery = params.libraryName;
 				const resolved = await getContext7LibrariesCached(searchQuery, maxResults, !!params.force_refresh, signal, attempts);
 				const libraries = resolved.libraries;
-				const selected = libraries.find((item) => item.id) || libraries[0];
+				const selected = selectContext7Library(libraries, params.libraryName, params.query);
 				const sections = [`## Context7 Resolve Library ID: ${params.libraryName}`];
 				if (selected?.id) {
 					sections.push(
@@ -4065,11 +4120,11 @@ export default function (pi: ExtensionAPI) {
 					if (isContext7LibraryId(libraryName)) {
 						libraryId = normalizeContext7LibraryId(libraryName);
 					} else {
-						const resolved = await getContext7LibrariesCached(`${libraryName} ${params.query}`, maxResults, forceRefresh, signal, attempts);
+						const resolved = await getContext7LibrariesCached(libraryName, maxResults, forceRefresh, signal, attempts);
 						resolveCache = resolved.cache;
 						resolveCachePath = resolved.cachePath;
 						librariesCount = resolved.libraries.length;
-						libraryId = resolved.libraries.find((item) => item.id)?.id || "";
+						libraryId = selectContext7Library(resolved.libraries, libraryName, params.query)?.id || "";
 					}
 				}
 				if (!libraryId) throw new Error("Context7 未解析到可用 libraryId");

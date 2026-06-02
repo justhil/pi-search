@@ -215,6 +215,33 @@ describe("pi-search extension", () => {
 		]);
 	});
 
+	it("prefers official Context7 docs over query-biased hook collections", async () => {
+		let requestedUrl = "";
+		const fetchMock = vi.fn(async (input: Parameters<typeof fetch>[0]) => {
+			const url = String(input);
+			requestedUrl = url;
+			if (url.startsWith("https://context7.test/api/v2/search")) {
+				return jsonResponse({
+					results: [
+						{ id: "/uidotdev/usehooks", title: "React Native Hooks", description: "Hooks collection", trustScore: 9, benchmarkScore: 90, totalSnippets: 500 },
+						{ id: "/facebook/react", title: "React", description: "The library for web and native user interfaces.", trustScore: 9.2, benchmarkScore: 72.9, totalSnippets: 3414 },
+						{ id: "/reactjs/react.dev", title: "React", description: "React.dev is the official documentation website for React.", trustScore: 10, benchmarkScore: 89.9, totalSnippets: 7143 },
+					],
+				});
+			}
+			throw new Error(`Unhandled fetch: ${url}`);
+		}) as typeof fetch;
+		globalThis.fetch = fetchMock;
+
+		const result = await runTool(installExtension(), "context7_resolve_library_id", {
+			libraryName: "React",
+			query: "hooks cleanup",
+		});
+
+		expect(result.details?.selected_library_id).toBe("/reactjs/react.dev");
+		expect(requestedUrl).toContain("query=React");
+	});
+
 	it("queries Context7 docs directly with a library ID", async () => {
 		const fetchMock = vi.fn(async (input: Parameters<typeof fetch>[0]) => {
 			const url = String(input);
@@ -237,6 +264,29 @@ describe("pi-search extension", () => {
 		expect(result.content[0]?.text).toContain("return () => unsubscribe();");
 		expect(result.details?.library_id).toBe("/react/react");
 		expect(result.details?.snippets_count).toBe(2);
+		expect(result.details?.provider_attempts).toEqual([
+			expect.objectContaining({ capability: "docs_search", provider: "context7_docs", ok: true }),
+		]);
+	});
+
+	it("renders non-json Context7 docs bodies without consuming the response twice", async () => {
+		const fetchMock = vi.fn(async (input: Parameters<typeof fetch>[0]) => {
+			const url = String(input);
+			if (url.startsWith("https://context7.test/api/v2/context")) {
+				return textResponse("Plain Context7 documentation body");
+			}
+			throw new Error(`Unhandled fetch: ${url}`);
+		}) as typeof fetch;
+		globalThis.fetch = fetchMock;
+
+		const result = await runTool(installExtension(), "context7_query_docs", {
+			libraryId: "/plain/docs",
+			query: "plain response",
+		});
+
+		expect(result.content[0]?.text).toContain("Plain Context7 documentation body");
+		expect(result.content[0]?.text).not.toContain("Body is unusable");
+		expect(result.details?.snippets_count).toBe(1);
 		expect(result.details?.provider_attempts).toEqual([
 			expect.objectContaining({ capability: "docs_search", provider: "context7_docs", ok: true }),
 		]);
