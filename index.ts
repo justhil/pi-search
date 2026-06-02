@@ -23,6 +23,11 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
+import { Defuddle } from "defuddle/node";
+import type { DefuddleResponse } from "defuddle/node";
+import { parseHTML } from "linkedom";
+import { fetch as wreqFetch } from "wreq-js";
+import type { BrowserProfile, EmulationOS, RequestInit as WreqRequestInit } from "wreq-js";
 import { appendFile, readFile, writeFile, mkdir } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
@@ -48,10 +53,33 @@ interface SearchConfigFile {
 	apiKey?: string;
 	model?: string;
 	searchProfile?: SearchProfile;
+	fallbackMode?: FallbackMode;
+	minimumProfile?: MinimumProfile;
 	tavilyApiKey?: string;
 	tavilyApiUrl?: string;
 	firecrawlApiKey?: string;
 	firecrawlApiUrl?: string;
+	context7ApiKey?: string;
+	context7BaseUrl?: string;
+	exaApiKey?: string;
+	exaBaseUrl?: string;
+}
+
+interface RuntimeConfig {
+	searchApiUrl: string;
+	searchApiKey: string;
+	searchModel: string;
+	searchProfile: SearchProfile;
+	fallbackMode: FallbackMode;
+	minimumProfile: MinimumProfile;
+	tavilyApiUrl: string;
+	tavilyApiKey: string;
+	firecrawlApiUrl: string;
+	firecrawlApiKey: string;
+	context7BaseUrl: string;
+	context7ApiKey: string;
+	exaBaseUrl: string;
+	exaApiKey: string;
 }
 
 interface Source {
@@ -63,8 +91,30 @@ interface Source {
 
 type SearchMode = "compact" | "normal" | "deep" | "sources_only";
 const WEB_FETCH_FORMAT_VALUES = ["markdown", "text", "html", "json", "raw"] as const;
+const WEB_FETCH_PROVIDER_VALUES = ["auto", "tavily", "firecrawl", "smart_direct", "direct"] as const;
 type WebFetchFormat = (typeof WEB_FETCH_FORMAT_VALUES)[number];
-type WebFetchProvider = "tavily" | "firecrawl" | "direct";
+type WebFetchProvider = "tavily" | "firecrawl" | "smart_direct" | "direct";
+type WebFetchProviderChoice = (typeof WEB_FETCH_PROVIDER_VALUES)[number];
+type SmartFetchIncludeReplies = boolean | "extractors";
+type Capability = "main_search" | "docs_search" | "web_search" | "web_fetch" | "site_map";
+type FallbackMode = "auto" | "off";
+type MinimumProfile = "standard" | "off";
+
+interface ProviderAttempt {
+	provider: string;
+	capability: Capability;
+	ok: boolean;
+	latencyMs: number;
+	error?: string;
+}
+
+interface CapabilityStatus {
+	capability: Capability;
+	providers: Array<{ provider: string; configured: boolean }>;
+	available: boolean;
+	required: boolean;
+	selected?: string;
+}
 
 interface WebFetchMetadata {
 	url: string;
@@ -78,6 +128,24 @@ interface WebFetchMetadata {
 	canonicalUrl?: string;
 	language?: string;
 	favicon?: string;
+	author?: string;
+	published?: string;
+	site?: string;
+	wordCount?: number;
+	browser?: string;
+	os?: string;
+}
+
+interface SmartDirectOptions {
+	browser: string;
+	os: string;
+	timeoutMs: number;
+	maxChars: number;
+	headers: Record<string, string>;
+	removeImages: boolean;
+	includeReplies: SmartFetchIncludeReplies;
+	proxy?: string;
+	verbose: boolean;
 }
 
 interface WebFetchResult {
@@ -301,6 +369,7 @@ class PlanningEngine {
 				plan[name] = record.data;
 			}
 			result.executable_plan = plan;
+			result.research_plan = buildResearchPlan(session);
 		}
 
 		return result;
@@ -309,6 +378,114 @@ class PlanningEngine {
 	private newSessionId(): string {
 		return Math.random().toString(36).slice(2, 14);
 	}
+}
+
+function buildResearchPlan(session: PlanningSession): Record<string, unknown> {
+	const intent = asRecord(session.phases.intent_analysis?.data);
+	const complexity = asRecord(session.phases.complexity_assessment?.data);
+	const decomposition = asArray(session.phases.query_decomposition?.data).filter(isRecord);
+	const strategy = asRecord(session.phases.search_strategy?.data);
+	const toolMappings = asArray(session.phases.tool_selection?.data).filter(isRecord);
+	const execution = asRecord(session.phases.execution_order?.data);
+	const tools = toolMappings.length > 0
+		? toolMappings.map((mapping) => String(mapping.tool || "search"))
+		: decomposition.map((item) => String(item.tool_hint || "search"));
+
+	return {
+		mode: "deep_research",
+		query_mode: "deep",
+		session_id: session.sessionId,
+		intent_signals: {
+			recency: ["realtime", "recent"].includes(String(intent.time_sensitivity || "")),
+			docs_api_intent: inferDocsIntent(intent, decomposition),
+			known_url: hasKnownUrl(intent, decomposition, strategy),
+			claim_risk: inferClaimRisk(intent, complexity),
+			source_authority_required: true,
+			cross_validation_required: session.complexityLevel === 3 || String(intent.query_type) === "fact_check",
+		},
+		decomposition,
+		capability_plan: [...new Set(tools.map((tool) => capabilityForTool(tool)))].map((capability) => ({
+			capability,
+			purpose: capabilityPurpose(capability),
+		})),
+		steps: buildResearchSteps(decomposition, strategy, toolMappings, execution),
+		evidence_policy: "fetch_before_claim",
+		gap_check: buildGapCheck(decomposition, toolMappings),
+		usage_boundary: "Offline plan only: this does not call providers, fetch pages, or verify claims automatically.",
+	};
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+	return isRecord(value) ? value : {};
+}
+
+function asArray(value: unknown): unknown[] {
+	return Array.isArray(value) ? value : value === undefined ? [] : [value];
+}
+
+function inferDocsIntent(intent: Record<string, unknown>, decomposition: Record<string, unknown>[]): boolean {
+	const text = [intent.core_question, intent.domain, ...decomposition.map((item) => item.goal)].join(" ").toLowerCase();
+	return /\b(api|sdk|docs?|documentation|reference|framework|library|github|readme|changelog|migration)\b/.test(text);
+}
+
+function hasKnownUrl(...values: unknown[]): boolean {
+	return /https?:\/\//.test(JSON.stringify(values));
+}
+
+function inferClaimRisk(intent: Record<string, unknown>, complexity: Record<string, unknown>): "low" | "medium" | "high" {
+	if (intent.query_type === "factual" || intent.query_type === "comparative") return "high";
+	if (Number(complexity.level || 0) >= 2) return "medium";
+	return "low";
+}
+
+function capabilityPurpose(capability: Capability): string {
+	const purposes: Record<Capability, string> = {
+		main_search: "Broad synthesis and current web-backed answering",
+		docs_search: "Official docs, SDK/API references, GitHub and authoritative technical sources",
+		web_search: "Supplementary web source discovery",
+		web_fetch: "Exact URL inspection before citing detailed claims",
+		site_map: "Discover relevant pages under a known site",
+	};
+	return purposes[capability];
+}
+
+function buildResearchSteps(
+	decomposition: Record<string, unknown>[],
+	strategy: Record<string, unknown>,
+	toolMappings: Record<string, unknown>[],
+	execution: Record<string, unknown>,
+): Array<Record<string, unknown>> {
+	const terms = asArray(strategy.search_terms).filter(isRecord);
+	const mappings = new Map(toolMappings.map((mapping) => [String(mapping.sub_query_id || ""), mapping]));
+	const steps = decomposition.map((item) => {
+		const id = String(item.id || "");
+		const mapping = mappings.get(id);
+		const term = terms.find((candidate) => String(candidate.purpose || "") === id);
+		const tool = String(mapping?.tool || item.tool_hint || "search");
+		return {
+			subquestion_id: id,
+			tool,
+			capability: capabilityForTool(tool),
+			purpose: mapping?.reason || item.goal || "Gather evidence",
+			query: term?.term || item.goal,
+			params: mapping?.params || mapping?.params_raw || {},
+		};
+	});
+	return steps.length > 0 ? steps : [{ tool: "search", capability: "main_search", purpose: "Gather initial evidence" }];
+}
+
+function buildGapCheck(
+	decomposition: Record<string, unknown>[],
+	toolMappings: Record<string, unknown>[],
+): string[] {
+	const mapped = new Set(toolMappings.map((mapping) => String(mapping.sub_query_id || "")));
+	const gaps: string[] = [];
+	for (const item of decomposition) {
+		const id = String(item.id || "");
+		if (id && !mapped.has(id)) gaps.push(`Sub-query ${id} has no explicit tool mapping.`);
+	}
+	if (toolMappings.length === 0) gaps.push("No tool mappings recorded; default to search and fetch high-value sources before claims.");
+	return gaps;
 }
 
 const planningEngine = new PlanningEngine();
@@ -331,12 +508,12 @@ class ConfigManager {
 	}
 
 	getConfigPath(): string {
-		return this.configPath;
+		return process.env.PI_SEARCH_CONFIG_PATH || this.configPath;
 	}
 
 	async loadFile(): Promise<SearchConfigFile> {
 		try {
-			const content = await readFile(this.configPath, "utf-8");
+			const content = await readFile(this.getConfigPath(), "utf-8");
 			return JSON.parse(content);
 		} catch {
 			return {};
@@ -344,21 +521,13 @@ class ConfigManager {
 	}
 
 	async saveFile(config: SearchConfigFile): Promise<void> {
-		await mkdir(dirname(this.configPath), { recursive: true });
-		await writeFile(this.configPath, JSON.stringify(config, null, 2), "utf-8");
+		const configPath = this.getConfigPath();
+		await mkdir(dirname(configPath), { recursive: true });
+		await writeFile(configPath, JSON.stringify(config, null, 2), "utf-8");
 		this.modelsCache = null;
 	}
 
-	async getFullConfig(): Promise<{
-		searchApiUrl: string;
-		searchApiKey: string;
-		searchModel: string;
-		searchProfile: SearchProfile;
-		tavilyApiUrl: string;
-		tavilyApiKey: string;
-		firecrawlApiUrl: string;
-		firecrawlApiKey: string;
-	}> {
+	async getFullConfig(): Promise<RuntimeConfig> {
 		const file = await this.loadFile();
 		const searchApiUrl = process.env.SEARCH_API_URL || file.apiUrl || DEFAULT_SEARCH_API_URL;
 		return {
@@ -371,6 +540,12 @@ class ConfigManager {
 			searchProfile: normalizeSearchProfile(
 				process.env.SEARCH_PROFILE || file.searchProfile,
 			),
+			fallbackMode: normalizeFallbackMode(
+				process.env.SEARCH_FALLBACK_MODE || file.fallbackMode,
+			),
+			minimumProfile: normalizeMinimumProfile(
+				process.env.SEARCH_MINIMUM_PROFILE || file.minimumProfile,
+			),
 			tavilyApiUrl:
 				process.env.TAVILY_API_URL ||
 				file.tavilyApiUrl ||
@@ -382,6 +557,16 @@ class ConfigManager {
 				"https://api.firecrawl.dev/v2",
 			firecrawlApiKey:
 				process.env.FIRECRAWL_API_KEY || file.firecrawlApiKey || "",
+			context7BaseUrl:
+				process.env.CONTEXT7_BASE_URL ||
+				file.context7BaseUrl ||
+				"https://context7.com",
+			context7ApiKey: process.env.CONTEXT7_API_KEY || file.context7ApiKey || "",
+			exaBaseUrl:
+				process.env.EXA_BASE_URL ||
+				file.exaBaseUrl ||
+				"https://api.exa.ai",
+			exaApiKey: process.env.EXA_API_KEY || file.exaApiKey || "",
 		};
 	}
 
@@ -415,6 +600,27 @@ class ConfigManager {
 		const file = await this.loadFile();
 		file.firecrawlApiKey = key;
 		if (url) file.firecrawlApiUrl = url;
+		await this.saveFile(file);
+	}
+
+	async setContext7(key: string, url?: string): Promise<void> {
+		const file = await this.loadFile();
+		file.context7ApiKey = key;
+		if (url) file.context7BaseUrl = url;
+		await this.saveFile(file);
+	}
+
+	async setExa(key: string, url?: string): Promise<void> {
+		const file = await this.loadFile();
+		file.exaApiKey = key;
+		if (url) file.exaBaseUrl = url;
+		await this.saveFile(file);
+	}
+
+	async setSearchRuntime(key: "fallbackMode" | "minimumProfile", value: string): Promise<void> {
+		const file = await this.loadFile();
+		if (key === "fallbackMode") file.fallbackMode = normalizeFallbackMode(value);
+		if (key === "minimumProfile") file.minimumProfile = normalizeMinimumProfile(value);
 		await this.saveFile(file);
 	}
 
@@ -476,6 +682,157 @@ function beginStatus(ctx: StatusContext, text: string): () => void {
 	};
 }
 
+async function withProviderAttempt<T>(
+	attempts: ProviderAttempt[],
+	capability: Capability,
+	provider: string,
+	fn: () => Promise<T>,
+): Promise<T> {
+	const start = Date.now();
+	try {
+		const value = await fn();
+		attempts.push({ provider, capability, ok: true, latencyMs: Date.now() - start });
+		return value;
+	} catch (e) {
+		attempts.push({
+			provider,
+			capability,
+			ok: false,
+			latencyMs: Date.now() - start,
+			error: e instanceof Error ? e.message : String(e),
+		});
+		throw e;
+	}
+}
+
+async function withOptionalProviderAttempt<T>(
+	attempts: ProviderAttempt[],
+	capability: Capability,
+	provider: string,
+	fn: () => Promise<T | null>,
+): Promise<T | null> {
+	const start = Date.now();
+	try {
+		const value = await fn();
+		attempts.push({
+			provider,
+			capability,
+			ok: value !== null,
+			latencyMs: Date.now() - start,
+			...(value === null ? { error: "no_content" } : {}),
+		});
+		return value;
+	} catch (e) {
+		attempts.push({
+			provider,
+			capability,
+			ok: false,
+			latencyMs: Date.now() - start,
+			error: e instanceof Error ? e.message : String(e),
+		});
+		throw e;
+	}
+}
+
+function hasSuccessfulAttempt(attempts: ProviderAttempt[], capability?: Capability): boolean {
+	return attempts.some((attempt) => attempt.ok && (!capability || attempt.capability === capability));
+}
+
+function fallbackUsed(attempts: ProviderAttempt[], capability?: Capability): boolean {
+	const scoped = capability ? attempts.filter((attempt) => attempt.capability === capability) : attempts;
+	return scoped.some((attempt) => !attempt.ok) && scoped.some((attempt) => attempt.ok);
+}
+
+function capabilityStatus(config: RuntimeConfig): CapabilityStatus[] {
+	const mainConfigured = !!(config.searchApiUrl && config.searchApiKey && config.searchModel);
+	const docsProviders = [
+		{ provider: "context7", configured: !!config.context7BaseUrl },
+		{ provider: "exa", configured: !!config.exaApiKey },
+	];
+	const webSearchProviders = [
+		{ provider: "tavily", configured: !!config.tavilyApiKey },
+		{ provider: "firecrawl", configured: !!config.firecrawlApiKey },
+	];
+	const webFetchProviders = [
+		{ provider: "tavily", configured: !!config.tavilyApiKey },
+		{ provider: "firecrawl", configured: !!config.firecrawlApiKey },
+		{ provider: "smart_direct", configured: true },
+		{ provider: "direct", configured: true },
+	];
+	const statuses: CapabilityStatus[] = [
+		{
+			capability: "main_search",
+			providers: [{ provider: "openai_compatible", configured: mainConfigured }],
+			available: mainConfigured,
+			required: config.minimumProfile === "standard",
+			selected: mainConfigured ? "openai_compatible" : undefined,
+		},
+		{
+			capability: "docs_search",
+			providers: docsProviders,
+			available: docsProviders.some((provider) => provider.configured),
+			required: config.minimumProfile === "standard",
+			selected: docsProviders.find((provider) => provider.configured)?.provider,
+		},
+		{
+			capability: "web_search",
+			providers: webSearchProviders,
+			available: webSearchProviders.some((provider) => provider.configured),
+			required: false,
+			selected: webSearchProviders.find((provider) => provider.configured)?.provider,
+		},
+		{
+			capability: "web_fetch",
+			providers: webFetchProviders,
+			available: true,
+			required: config.minimumProfile === "standard",
+			selected: webFetchProviders.find((provider) => provider.configured)?.provider,
+		},
+		{
+			capability: "site_map",
+			providers: [{ provider: "tavily", configured: !!config.tavilyApiKey }],
+			available: !!config.tavilyApiKey,
+			required: false,
+			selected: config.tavilyApiKey ? "tavily" : undefined,
+		},
+	];
+	return statuses;
+}
+
+function minimumProfileSatisfied(statuses: CapabilityStatus[], profile: MinimumProfile): boolean {
+	if (profile === "off") return true;
+	return statuses.every((status) => !status.required || status.available);
+}
+
+function providerAttemptsMarkdown(attempts: ProviderAttempt[]): string[] {
+	if (attempts.length === 0) return [];
+	return [
+		"\n### Provider attempts",
+		...attempts.map((attempt) => {
+			const state = attempt.ok ? "✅" : "❌";
+			const error = attempt.error ? ` — ${attempt.error}` : "";
+			return `- ${state} ${attempt.capability}/${attempt.provider}: ${attempt.latencyMs}ms${error}`;
+		}),
+	];
+}
+
+function capabilityDiagnostics(
+	config: RuntimeConfig,
+	attempts: ProviderAttempt[],
+	capability?: Capability,
+): Record<string, unknown> {
+	const statuses = capabilityStatus(config);
+	return {
+		provider_attempts: attempts,
+		fallback_used: fallbackUsed(attempts, capability),
+		capability_status: statuses,
+		minimum_profile: {
+			profile: config.minimumProfile,
+			satisfied: minimumProfileSatisfied(statuses, config.minimumProfile),
+		},
+	};
+}
+
 // =============================================================================
 // HTTP Utilities
 // =============================================================================
@@ -484,6 +841,15 @@ const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 const DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024;
 const DEFAULT_MAX_OUTPUT_LINES = 800;
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
+const SMART_DIRECT_DEFAULT_BROWSER = "chrome_145";
+const SMART_DIRECT_DEFAULT_OS = "windows";
+const SMART_DIRECT_DEFAULT_TIMEOUT_MS = 15_000;
+const SMART_DIRECT_DEFAULT_MAX_CHARS = 50_000;
+const SMART_DIRECT_DEFAULT_INCLUDE_REPLIES: SmartFetchIncludeReplies = "extractors";
+const SMART_DIRECT_ACCEPT = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+const SMART_DIRECT_ACCEPT_LANGUAGE = "en-US,en;q=0.9";
+const AUTO_FOLD_BYTES = 8 * 1024;
+const AUTO_FOLD_LINES = 180;
 const DIRECT_FETCH_MIN_INPUT_BYTES = 256 * 1024;
 const DIRECT_FETCH_MAX_INPUT_BYTES = 2 * 1024 * 1024;
 const DIRECT_FETCH_LARGE_BODY_BYTES = 5 * 1024 * 1024;
@@ -706,6 +1072,14 @@ function parseSearchProfile(value: unknown): SearchProfile | null {
 
 function normalizeSearchProfile(value: unknown): SearchProfile {
 	return parseSearchProfile(value) || "auto";
+}
+
+function normalizeFallbackMode(value: unknown): FallbackMode {
+	return value === "off" ? "off" : "auto";
+}
+
+function normalizeMinimumProfile(value: unknown): MinimumProfile {
+	return value === "off" ? "off" : "standard";
 }
 
 function formatSearchProfile(profile: SearchProfile): string {
@@ -1011,28 +1385,38 @@ function extensionForOutputFormat(format: WebFetchFormat): string {
 	return "md";
 }
 
-async function truncateToolOutput(content: string, prefix: string, options: { maxBytes?: number; maxLines?: number; extension?: string } = {}): Promise<{
+async function truncateToolOutput(content: string, prefix: string, options: { maxBytes?: number; maxLines?: number; extension?: string; foldBytes?: number; foldLines?: number } = {}): Promise<{
 	content: string;
 	truncated: boolean;
+	folded?: boolean;
 	fullOutputPath?: string;
 	outputBytes: number;
 	totalBytes: number;
 	outputLines: number;
 	totalLines: number;
 }> {
-	const truncation = truncateText(content, options);
-	if (!truncation.truncated) return truncation;
+	const maxBytes = options.maxBytes ?? 12 * 1024;
+	const maxLines = options.maxLines ?? 400;
+	const foldBytes = Math.min(maxBytes, options.foldBytes ?? AUTO_FOLD_BYTES);
+	const foldLines = Math.min(maxLines, options.foldLines ?? AUTO_FOLD_LINES);
+	const preview = truncateText(content, { maxBytes: foldBytes, maxLines: foldLines });
+	if (!preview.truncated) return preview;
 
 	const fullOutputPath = await saveFullOutput(prefix, content, options.extension);
+	const hardTruncated = content.length > preview.content.length && (
+		preview.totalBytes > maxBytes || preview.totalLines > maxLines
+	);
 	let notice =
-		`\n\n[Output truncated: ${truncation.outputLines} of ${truncation.totalLines} lines ` +
-		`(${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}).`;
+		`\n\n[Output ${hardTruncated ? "truncated" : "folded"}: showing ${preview.outputLines} of ${preview.totalLines} lines ` +
+		`(${formatSize(preview.outputBytes)} of ${formatSize(preview.totalBytes)}).`;
 	if (fullOutputPath) notice += ` Full output saved to: ${fullOutputPath}`;
 	notice += "]";
 
 	return {
-		...truncation,
-		content: truncation.content + notice,
+		...preview,
+		truncated: hardTruncated,
+		folded: !hardTruncated,
+		content: preview.content + notice,
 		fullOutputPath: fullOutputPath || undefined,
 	};
 }
@@ -1615,6 +1999,297 @@ async function parseStreamResponse(response: Response): Promise<string> {
 }
 
 // =============================================================================
+// Docs Search Providers (Context7 + Exa)
+// =============================================================================
+
+interface Context7LibraryItem {
+	id?: string;
+	title?: string;
+	description?: string;
+	trustScore?: number;
+	benchmarkScore?: number;
+	totalSnippets?: number;
+	stars?: number;
+}
+
+interface ExaResultItem {
+	id?: string;
+	title?: string;
+	url?: string;
+	publishedDate?: string;
+	author?: string;
+	score?: number;
+	text?: string;
+	highlights?: string[];
+}
+
+interface DocsSearchOptions {
+	provider?: "auto" | "context7" | "exa" | "all";
+	libraryId?: string;
+	maxResults?: number;
+	maxOutputBytes?: number;
+}
+
+function shouldUseDocsSearch(profile: SearchProfile, query: string): boolean {
+	if (["coding_docs", "code_examples", "project_research"].includes(profile)) return true;
+	const lower = query.toLowerCase();
+	return /\b(api|sdk|docs?|documentation|reference|framework|library|github|readme|changelog|release notes?|migration|typescript|javascript|python|react|vue|next\.js|node\.js)\b/.test(lower);
+}
+
+function capabilityForTool(tool: string): Capability {
+	if (tool === "docs_search") return "docs_search";
+	if (tool === "web_fetch") return "web_fetch";
+	if (tool === "web_map") return "site_map";
+	return "main_search";
+}
+
+function context7Headers(apiKey: string): Record<string, string> {
+	const headers: Record<string, string> = {
+		Accept: "application/json, text/plain",
+		"X-Context7-Source": "pi-search",
+	};
+	if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+	return headers;
+}
+
+async function context7LibrarySearch(
+	query: string,
+	maxResults = 5,
+	signal?: AbortSignal,
+): Promise<Context7LibraryItem[]> {
+	const config = await configManager.getFullConfig();
+	const endpoint = `${config.context7BaseUrl.replace(/\/+$/, "")}/api/v2/search?query=${encodeURIComponent(query)}`;
+	const response = await fetchWithRetry(
+		endpoint,
+		{
+			headers: context7Headers(config.context7ApiKey),
+			signal: createTimeoutSignal(DEFAULT_REQUEST_TIMEOUT_MS, signal),
+		},
+	);
+	const data = await response.json().catch(async () => ({ content: await response.text() })) as unknown;
+	const raw = Array.isArray(data) ? data : isRecord(data) && Array.isArray(data.results) ? data.results : [];
+	return raw
+		.filter(isRecord)
+		.slice(0, maxResults)
+		.map((item) => ({
+			id: firstString(item, ["id"]),
+			title: firstString(item, ["title", "name"]),
+			description: firstString(item, ["description", "summary"]),
+			trustScore: typeof item.trustScore === "number" ? item.trustScore : undefined,
+			benchmarkScore: typeof item.benchmarkScore === "number" ? item.benchmarkScore : undefined,
+			totalSnippets: typeof item.totalSnippets === "number" ? item.totalSnippets : undefined,
+			stars: typeof item.stars === "number" ? item.stars : undefined,
+		}));
+}
+
+async function context7Docs(
+	libraryId: string,
+	query: string,
+	signal?: AbortSignal,
+): Promise<unknown[]> {
+	const config = await configManager.getFullConfig();
+	const endpoint = `${config.context7BaseUrl.replace(/\/+$/, "")}/api/v2/context?libraryId=${encodeURIComponent(libraryId)}&query=${encodeURIComponent(query)}`;
+	const response = await fetchWithRetry(
+		endpoint,
+		{
+			headers: context7Headers(config.context7ApiKey),
+			signal: createTimeoutSignal(DEFAULT_REQUEST_TIMEOUT_MS, signal),
+		},
+	);
+	const data = await response.json().catch(async () => ({ content: await response.text() })) as unknown;
+	if (!isRecord(data)) return [];
+	const code = Array.isArray(data.codeSnippets) ? data.codeSnippets : [];
+	const info = Array.isArray(data.infoSnippets) ? data.infoSnippets : [];
+	return [...code, ...info];
+}
+
+function context7LibraryUrl(baseUrl: string, id: string | undefined): string {
+	if (!id) return baseUrl.replace(/\/+$/, "");
+	if (/^https?:\/\//.test(id)) return id;
+	return `${baseUrl.replace(/\/+$/, "")}/${id.replace(/^\/+/, "")}`;
+}
+
+function context7LibrarySources(items: Context7LibraryItem[], baseUrl: string): Source[] {
+	return items.map((item) => ({
+		url: context7LibraryUrl(baseUrl, item.id),
+		title: item.title || item.id || "Context7 library",
+		description: item.description,
+		provider: "context7",
+	}));
+}
+
+function formatContext7Snippet(snippet: unknown): string {
+	if (typeof snippet === "string") return snippet.slice(0, 800);
+	if (!isRecord(snippet)) return JSON.stringify(snippet).slice(0, 800);
+	const title = firstString(snippet, ["title", "name", "filePath"]);
+	const content = firstString(snippet, ["content", "text", "description", "code"]);
+	return [title ? `**${title}**` : "", content || JSON.stringify(snippet)].filter(Boolean).join("\n").slice(0, 1200);
+}
+
+async function exaSearch(
+	query: string,
+	maxResults = 5,
+	signal?: AbortSignal,
+): Promise<ExaResultItem[]> {
+	const config = await configManager.getFullConfig();
+	if (!config.exaApiKey) return [];
+	const response = await fetchWithRetry(
+		`${config.exaBaseUrl.replace(/\/+$/, "")}/search`,
+		{
+			method: "POST",
+			headers: {
+				accept: "application/json",
+				"content-type": "application/json",
+				"x-api-key": config.exaApiKey,
+			},
+			body: JSON.stringify({
+				query,
+				numResults: maxResults,
+				type: "neural",
+				useAutoprompt: true,
+				contents: { highlights: true },
+			}),
+			signal: createTimeoutSignal(DEFAULT_REQUEST_TIMEOUT_MS, signal),
+		},
+	);
+	const data = await response.json() as { results?: ExaResultItem[] };
+	return (data.results || []).filter((item) => item.url || item.id).slice(0, maxResults);
+}
+
+function exaSources(items: ExaResultItem[]): Source[] {
+	return items.map((item) => ({
+		url: item.url || item.id || "",
+		title: item.title || item.url || item.id || "Exa result",
+		description: item.highlights?.[0] || item.text,
+		provider: "exa",
+	})).filter((item) => item.url);
+}
+
+async function docsSearchSources(
+	query: string,
+	maxResults: number,
+	signal: AbortSignal | undefined,
+	attempts: ProviderAttempt[],
+): Promise<Source[]> {
+	const config = await configManager.getFullConfig();
+	const sources: Source[] = [];
+	try {
+		const libraries = await withProviderAttempt(
+			attempts,
+			"docs_search",
+			"context7",
+			() => context7LibrarySearch(query, maxResults, signal),
+		);
+		sources.push(...context7LibrarySources(libraries, config.context7BaseUrl));
+	} catch (e) {
+		if (e instanceof Error && e.name === "AbortError") throw e;
+	}
+
+	if (config.exaApiKey && config.fallbackMode === "auto") {
+		try {
+			const exa = await withProviderAttempt(
+				attempts,
+				"docs_search",
+				"exa",
+				() => exaSearch(query, maxResults, signal),
+			);
+			sources.push(...exaSources(exa));
+		} catch (e) {
+			if (e instanceof Error && e.name === "AbortError") throw e;
+		}
+	}
+
+	return limitSources(mergeSources(sources), maxResults);
+}
+
+async function runDocsSearch(
+	query: string,
+	options: DocsSearchOptions,
+	signal?: AbortSignal,
+): Promise<{ output: string; sources: Source[]; attempts: ProviderAttempt[]; capabilityStatus: CapabilityStatus[] }> {
+	const config = await configManager.getFullConfig();
+	const attempts: ProviderAttempt[] = [];
+	const provider = options.provider || "auto";
+	const maxResults = clampNumber(options.maxResults, 6, 1, 20);
+	const sections: string[] = [`## Docs Search: ${query}`];
+	const sources: Source[] = [];
+	let context7Libraries: Context7LibraryItem[] = [];
+	let context7Snippets: unknown[] = [];
+	let exaResults: ExaResultItem[] = [];
+
+	if (provider === "auto" || provider === "context7" || provider === "all") {
+		try {
+			context7Libraries = await withProviderAttempt(
+				attempts,
+				"docs_search",
+				"context7",
+				() => context7LibrarySearch(query, maxResults, signal),
+			);
+			sources.push(...context7LibrarySources(context7Libraries, config.context7BaseUrl));
+			const libraryId = options.libraryId || context7Libraries.find((item) => item.id)?.id;
+			if (libraryId) {
+				context7Snippets = await withProviderAttempt(
+					attempts,
+					"docs_search",
+					"context7_docs",
+					() => context7Docs(libraryId, query, signal),
+				);
+			}
+		} catch (e) {
+			if (e instanceof Error && e.name === "AbortError") throw e;
+		}
+	}
+
+	const shouldRunExa =
+		!!config.exaApiKey &&
+		(provider === "exa" || provider === "all" || (provider === "auto" && (config.fallbackMode === "auto" || sources.length === 0)));
+	if (shouldRunExa) {
+		try {
+			exaResults = await withProviderAttempt(
+				attempts,
+				"docs_search",
+				"exa",
+				() => exaSearch(query, maxResults, signal),
+			);
+			sources.push(...exaSources(exaResults));
+		} catch (e) {
+			if (e instanceof Error && e.name === "AbortError") throw e;
+		}
+	}
+
+	if (context7Libraries.length > 0) {
+		sections.push("\n### Context7 libraries");
+		for (const item of context7Libraries) {
+			const meta = [
+				item.trustScore !== undefined ? `trust=${item.trustScore}` : "",
+				item.stars !== undefined ? `stars=${item.stars}` : "",
+			].filter(Boolean).join(", ");
+			sections.push(`- [${item.title || item.id}](${context7LibraryUrl(config.context7BaseUrl, item.id)})${meta ? ` (${meta})` : ""}${item.description ? ` — ${item.description}` : ""}`);
+		}
+	}
+	if (context7Snippets.length > 0) {
+		sections.push("\n### Context7 snippets");
+		for (const snippet of context7Snippets.slice(0, 3)) sections.push(`\n${formatContext7Snippet(snippet)}`);
+	}
+	if (exaResults.length > 0) {
+		sections.push("\n### Exa results");
+		for (const item of exaResults) {
+			const url = item.url || item.id || "";
+			sections.push(`- [${item.title || url}](${url})${item.highlights?.[0] ? ` — ${item.highlights[0]}` : ""}`);
+		}
+	}
+	if (sources.length === 0) sections.push("\n未返回 docs_search 结果。请检查 Context7/Exa 配置或缩小查询。");
+	sections.push(...providerAttemptsMarkdown(attempts));
+
+	return {
+		output: sections.join("\n"),
+		sources: mergeSources(sources),
+		attempts,
+		capabilityStatus: capabilityStatus(config),
+	};
+}
+
+// =============================================================================
 // Tavily API Client
 // =============================================================================
 
@@ -1931,12 +2606,212 @@ function normalizeWebFetchFormat(value: unknown): WebFetchFormat {
 		: "markdown";
 }
 
+function normalizeWebFetchProviderChoice(value: unknown): WebFetchProviderChoice {
+	return WEB_FETCH_PROVIDER_VALUES.includes(value as WebFetchProviderChoice)
+		? (value as WebFetchProviderChoice)
+		: "auto";
+}
+
 function normalizeHttpUrl(value: string): string {
 	const url = new URL(value);
 	if (url.protocol !== "http:" && url.protocol !== "https:") {
 		throw new Error("web_fetch 只支持 HTTP/HTTPS URL");
 	}
 	return url.href;
+}
+
+function resolveSmartDirectOptions(params: Record<string, unknown>): SmartDirectOptions {
+	return {
+		browser: stringParam(params.browser, SMART_DIRECT_DEFAULT_BROWSER),
+		os: stringParam(params.os, SMART_DIRECT_DEFAULT_OS),
+		timeoutMs: clampNumber(params.timeout_ms as number | undefined, SMART_DIRECT_DEFAULT_TIMEOUT_MS, 1000, DEFAULT_REQUEST_TIMEOUT_MS),
+		maxChars: clampNumber(params.maxChars as number | undefined, SMART_DIRECT_DEFAULT_MAX_CHARS, 1000, 200_000),
+		headers: normalizeHeaderRecord(params.headers),
+		removeImages: booleanParam(params.remove_images, false),
+		includeReplies: normalizeIncludeReplies(params.include_replies),
+		...(typeof params.proxy === "string" && params.proxy.trim() ? { proxy: params.proxy.trim() } : {}),
+		verbose: booleanParam(params.verbose, false),
+	};
+}
+
+function stringParam(value: unknown, fallback: string): string {
+	return typeof value === "string" && value.trim() ? value.trim() : fallback;
+}
+
+function booleanParam(value: unknown, fallback: boolean): boolean {
+	return typeof value === "boolean" ? value : fallback;
+}
+
+function normalizeIncludeReplies(value: unknown): SmartFetchIncludeReplies {
+	if (typeof value === "boolean") return value;
+	return value === "extractors" ? "extractors" : SMART_DIRECT_DEFAULT_INCLUDE_REPLIES;
+}
+
+function normalizeHeaderRecord(value: unknown): Record<string, string> {
+	if (!isRecord(value)) return {};
+	const headers: Record<string, string> = {};
+	for (const [key, raw] of Object.entries(value)) {
+		if (!key.trim()) continue;
+		if (typeof raw === "string" || typeof raw === "number" || typeof raw === "boolean") {
+			headers[key] = String(raw);
+		}
+	}
+	return headers;
+}
+
+function smartDirectSupported(format: WebFetchFormat): boolean {
+	return format === "markdown" || format === "html" || format === "text";
+}
+
+async function smartDirectFetch(
+	url: string,
+	format: WebFetchFormat,
+	options: SmartDirectOptions,
+	signal?: AbortSignal,
+): Promise<WebFetchResult | null> {
+	if (!smartDirectSupported(format)) return null;
+	const targetUrl = normalizeHttpUrl(url);
+	try {
+		const response = await wreqFetch(targetUrl, {
+			browser: options.browser as BrowserProfile,
+			os: options.os as EmulationOS,
+			headers: {
+				Accept: SMART_DIRECT_ACCEPT,
+				"Accept-Language": SMART_DIRECT_ACCEPT_LANGUAGE,
+				...options.headers,
+			},
+			redirect: "follow",
+			timeout: options.timeoutMs,
+			...(options.proxy ? { proxy: options.proxy } : {}),
+			signal: createTimeoutSignal(options.timeoutMs, signal),
+		} satisfies WreqRequestInit);
+
+		const metadata = smartDirectMetadata(targetUrl, response, options);
+		if (!response.ok) {
+			await debugLog("smart_direct.http_failed", { url, status: response.status });
+			return null;
+		}
+		if (!isSmartDirectContent(metadata.contentType)) {
+			await debugLog("smart_direct.unsupported_content", { url, contentType: metadata.contentType });
+			return null;
+		}
+
+		const html = await response.text();
+		if (!html.trim()) return null;
+		const finalUrl = metadata.finalUrl || targetUrl;
+		const document = parseSmartDirectHtml(html, finalUrl);
+		const extracted = await Defuddle(document, finalUrl, {
+			markdown: format !== "html",
+			removeImages: options.removeImages,
+			includeReplies: options.includeReplies,
+		});
+		if (!extracted.content || extracted.wordCount === 0) {
+			await debugLog("smart_direct.empty_extract", { url, finalUrl });
+			return null;
+		}
+
+		Object.assign(metadata, smartDirectExtractedMetadata(extracted, options));
+		const normalized = format === "text" ? markdownToPlainText(extracted.content) : extracted.content;
+		const limited = normalized.slice(0, options.maxChars).trim();
+		const content = formatSmartDirectContent(limited, metadata, options.verbose);
+		return { content, provider: "smart_direct", format, metadata };
+	} catch (e) {
+		if (e instanceof Error && e.name === "AbortError") throw e;
+		await debugLog("smart_direct.fetch_failed", {
+			url,
+			format,
+			error: e instanceof Error ? e.message : String(e),
+		});
+		return null;
+	}
+}
+
+function isSmartDirectContent(contentType: string | undefined): boolean {
+	if (!contentType) return true;
+	const lower = contentType.toLowerCase();
+	return lower.includes("text/html") || lower.includes("application/xhtml+xml") || lower.includes("text/plain") || lower.includes("text/markdown");
+}
+
+function smartDirectMetadata(url: string, response: { url?: string; status?: number; headers: { get(name: string): string | null } }, options: SmartDirectOptions): WebFetchMetadata {
+	const contentLength = parseContentLength(response.headers.get("content-length"));
+	const contentType = response.headers.get("content-type") || undefined;
+	return {
+		url,
+		...(response.url ? { finalUrl: response.url } : {}),
+		...(typeof response.status === "number" ? { status: response.status } : {}),
+		...(contentType ? { contentType } : {}),
+		...(contentLength !== null ? { contentLength } : {}),
+		browser: options.browser,
+		os: options.os,
+	};
+}
+
+function parseSmartDirectHtml(html: string, url: string): Document {
+	const { document } = parseHTML(html);
+	const doc = document as unknown as {
+		styleSheets?: unknown;
+		URL?: string;
+		defaultView?: { getComputedStyle?: () => CSSStyleDeclaration };
+	};
+	if (!doc.styleSheets) doc.styleSheets = [];
+	if (doc.defaultView && !doc.defaultView.getComputedStyle) {
+		doc.defaultView.getComputedStyle = () => ({ display: "" } as unknown as CSSStyleDeclaration);
+	}
+	doc.URL = url;
+	return document;
+}
+
+function smartDirectExtractedMetadata(extracted: DefuddleResponse, options: SmartDirectOptions): Partial<WebFetchMetadata> {
+	return {
+		...(extracted.title ? { title: extracted.title } : {}),
+		...(extracted.description ? { description: extracted.description } : {}),
+		...(extracted.author ? { author: extracted.author } : {}),
+		...(extracted.published ? { published: extracted.published } : {}),
+		...(extracted.site ? { site: extracted.site } : {}),
+		...(extracted.language ? { language: extracted.language } : {}),
+		...(extracted.favicon ? { favicon: extracted.favicon } : {}),
+		...(typeof extracted.wordCount === "number" ? { wordCount: extracted.wordCount } : {}),
+		browser: options.browser,
+		os: options.os,
+	};
+}
+
+function formatSmartDirectContent(content: string, metadata: WebFetchMetadata, verbose: boolean): string {
+	const headerFields: Array<[string, string | number | undefined]> = verbose
+		? [
+			["URL", metadata.finalUrl || metadata.url],
+			["Title", metadata.title],
+			["Author", metadata.author],
+			["Published", metadata.published],
+			["Site", metadata.site],
+			["Language", metadata.language],
+			["Words", metadata.wordCount],
+			["Browser", metadata.browser && metadata.os ? `${metadata.browser}/${metadata.os}` : undefined],
+		]
+		: [
+			["URL", metadata.finalUrl || metadata.url],
+			["Title", metadata.title],
+			["Author", metadata.author],
+			["Published", metadata.published],
+		];
+	const header = headerFields
+		.filter(([, value]) => value !== undefined && value !== "")
+		.map(([label, value]) => `> ${label}: ${value}`)
+		.join("\n");
+	return header ? `${header}\n\n${content}`.trim() : content.trim();
+}
+
+function markdownToPlainText(markdown: string): string {
+	return markdown
+		.replace(/```[\s\S]*?```/g, (block) => block.replace(/```/g, ""))
+		.replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+		.replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+		.replace(/[*_~`>#-]+/g, " ")
+		.replace(/[ \t]+/g, " ")
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter(Boolean)
+		.join("\n");
 }
 
 async function directFetch(
@@ -2383,6 +3258,30 @@ function webFetchDetails(result: WebFetchResult, outputDetails: Record<string, u
 	};
 }
 
+function fetchFailure(
+	url: string,
+	format: WebFetchFormat,
+	providerChoice: WebFetchProviderChoice,
+	config: RuntimeConfig,
+	attempts: ProviderAttempt[],
+): { content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> } {
+	return {
+		content: [
+			{
+				type: "text",
+				text: `提取失败: provider=${providerChoice} 未能获取可注入的文本内容。可尝试 provider=auto、换用 search 搜索，或缩小 URL 范围。`,
+			},
+		],
+		details: {
+			url,
+			format,
+			provider_choice: providerChoice,
+			error: attempts.length === 0 ? "provider_not_configured_or_unsupported" : "all_failed",
+			...capabilityDiagnostics(config, attempts, "web_fetch"),
+		},
+	};
+}
+
 // =============================================================================
 // Prompts
 // =============================================================================
@@ -2395,10 +3294,16 @@ const searchConfigParameters = Type.Object({
 			"searchApiKey",
 			"model",
 			"searchProfile",
+			"fallbackMode",
+			"minimumProfile",
 			"tavilyApiKey",
 			"tavilyApiUrl",
 			"firecrawlApiKey",
 			"firecrawlApiUrl",
+			"context7ApiKey",
+			"context7BaseUrl",
+			"exaApiKey",
+			"exaBaseUrl",
 		] as const),
 	),
 	value: Type.Optional(Type.String()),
@@ -2556,15 +3461,41 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 
+				const attempts: ProviderAttempt[] = [];
 				const tasks: Promise<unknown>[] = [
-					searchWithModel(params.query, params.platform || "", signal, effectiveModel, controls, profile),
+					withProviderAttempt(
+						attempts,
+						"main_search",
+						"openai_compatible",
+						() => searchWithModel(params.query, params.platform || "", signal, effectiveModel, controls, profile),
+					),
 				];
 
 				if (extraBudget.tavily > 0) {
-					tasks.push(tavilySearch(params.query, extraBudget.tavily, signal));
+					tasks.push(withOptionalProviderAttempt(
+						attempts,
+						"web_search",
+						"tavily",
+						async () => {
+							const sources = await tavilySearch(params.query, extraBudget.tavily, signal);
+							return sources.length > 0 ? sources : null;
+						},
+					));
 				}
 				if (extraBudget.firecrawl > 0) {
-					tasks.push(firecrawlSearch(params.query, extraBudget.firecrawl, signal));
+					tasks.push(withOptionalProviderAttempt(
+						attempts,
+						"web_search",
+						"firecrawl",
+						async () => {
+							const sources = await firecrawlSearch(params.query, extraBudget.firecrawl, signal);
+							return sources.length > 0 ? sources : null;
+						},
+					));
+				}
+				const docsSearchEnabled = controls.maxSources > 0 && config.fallbackMode === "auto" && shouldUseDocsSearch(profile, params.query);
+				if (docsSearchEnabled) {
+					tasks.push(docsSearchSources(params.query, Math.min(controls.maxSources || 6, 8), signal, attempts));
 				}
 
 				const results = await Promise.allSettled(tasks);
@@ -2580,18 +3511,22 @@ export default function (pi: ExtensionAPI) {
 				let resultIndex = 1;
 				const tavilySources =
 					extraBudget.tavily > 0
-						? getSettledValue<Source[]>(results[resultIndex++], [])
+						? (getSettledValue<Source[] | null>(results[resultIndex++], null) ?? [])
 						: [];
 				const firecrawlSources =
 					extraBudget.firecrawl > 0
-						? getSettledValue<Source[]>(results[resultIndex], [])
+						? (getSettledValue<Source[] | null>(results[resultIndex++], null) ?? [])
 						: [];
+				const docsSources = docsSearchEnabled
+					? getSettledValue<Source[]>(results[resultIndex], [])
+					: [];
 
 				// Parse Search Model response
 				const { answer, sources: primarySources } =
 					splitAnswerAndSources(primaryResult);
 				const allSources = mergeSources(
 					primarySources,
+					docsSources,
 					tavilySources,
 					firecrawlSources,
 				);
@@ -2634,6 +3569,8 @@ export default function (pi: ExtensionAPI) {
 						profile,
 						mode: controls.mode,
 						model: effectiveModel,
+						docs_search_enriched: docsSources.length > 0,
+						...capabilityDiagnostics(config, attempts),
 						...outputDetails,
 					},
 				};
@@ -2641,6 +3578,77 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(
 					`搜索失败: ${e instanceof Error ? e.message : String(e)}`,
 				);
+			} finally {
+				endStatus();
+			}
+		},
+	});
+
+	// =========================================================================
+	// Tool: docs_search — Context7 + Exa 文档检索
+	// =========================================================================
+	pi.registerTool({
+		name: "docs_search",
+		label: "Docs Search",
+		description:
+			"通过 Context7 和 Exa 检索官方文档、SDK/API、框架资料、GitHub 与高可信技术来源。\n" +
+			"适用于 coding_docs、code_examples、project_research 等场景；返回内容和 session_id（用于 search_sources 获取完整信源）。",
+		promptSnippet: "Context7 + Exa 官方文档/API/GitHub 检索",
+		promptGuidelines: [
+			"Use docs_search for SDK/API/framework documentation, official docs, changelog, migration, GitHub project and code examples.",
+			"Prefer Context7 for library/API docs and Exa for official domains, GitHub, papers, product docs and trusted source discovery.",
+			"Use web_fetch on selected high-value URLs before citing detailed claims.",
+		],
+		parameters: Type.Object({
+			query: Type.String({ description: "文档/API/框架/GitHub 检索查询" }),
+			provider: Type.Optional(
+				StringEnum(["auto", "context7", "exa", "all"] as const, {
+					description: "provider 选择。auto 默认 Context7，配置 Exa 且允许 fallback 时补充 Exa。",
+				}),
+			),
+			library_id: Type.Optional(Type.String({ description: "Context7 libraryId；留空时自动使用首个库结果" })),
+			max_results: Type.Optional(Type.Number({ description: "最大结果数（1-20），默认 6", minimum: 1, maximum: 20 })),
+			max_output_bytes: Type.Optional(Type.Number({ description: "返回内容最大字节数，默认 12000", minimum: 3000, maximum: 51200 })),
+		}),
+
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const config = await configManager.getFullConfig();
+			const endStatus = beginStatus(ctx, "Docs Search");
+			try {
+				const sessionId = newSessionId();
+				const result = await runDocsSearch(
+					params.query,
+					{
+						provider: params.provider,
+						libraryId: params.library_id,
+						maxResults: params.max_results,
+						maxOutputBytes: params.max_output_bytes,
+					},
+					signal,
+				);
+				sourcesCache.set(sessionId, result.sources);
+				let output = result.output;
+				if (result.sources.length > 0) {
+					const visibleSources = limitSources(result.sources, clampNumber(params.max_results, 6, 1, 20));
+					output += `\n\n---\n**信源 (${visibleSources.length}/${result.sources.length})** | session_id: \`${sessionId}\`\n`;
+					for (const s of visibleSources) output += s.title ? `- [${s.title}](${s.url}) [${s.provider || "docs"}]\n` : `- ${s.url}\n`;
+					if (result.sources.length > visibleSources.length) {
+						output += `- ... 还有 ${result.sources.length - visibleSources.length} 个信源，使用 search_sources 分页获取\n`;
+					}
+				}
+				const rendered = await truncateToolOutput(output, "docs-search", {
+					maxBytes: clampNumber(params.max_output_bytes, 12000, 3000, 50 * 1024),
+				});
+				const { content, ...outputDetails } = rendered;
+				return {
+					content: [{ type: "text", text: content }],
+					details: {
+						session_id: sessionId,
+						sources_count: result.sources.length,
+						...capabilityDiagnostics(config, result.attempts, "docs_search"),
+						...outputDetails,
+					},
+				};
 			} finally {
 				endStatus();
 			}
@@ -2731,14 +3739,14 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// =========================================================================
-	// Tool: web_fetch — 网页内容抓取（Tavily → Firecrawl → direct 自动降级）
+	// Tool: web_fetch — 网页内容抓取（Tavily → Firecrawl → smart_direct → direct 自动降级）
 	// =========================================================================
 	pi.registerTool({
 		name: "web_fetch",
 		label: "Web Fetch",
 		description:
 			"独立抓取一个明确的 HTTP/HTTPS URL，并返回受输出预算保护的页面/API 预览。\n" +
-			"默认 format=markdown；markdown/text 优先使用 Tavily Extract，markdown/html/raw 可降级到 Firecrawl Scrape，最后使用带常见浏览器请求头的 direct fetch。\n" +
+			"默认 format=markdown；markdown/text 优先使用 Tavily Extract，markdown/html/raw 可降级到 Firecrawl Scrape，再用 smart_direct（wreq-js TLS 指纹 + Defuddle 可读正文提取），最后使用 direct fetch。\n" +
 			"可独立用于用户给定 URL，也可作为 search 后检查选中信源的后续工具；不执行 JavaScript，不处理登录会话，也不是批量下载器。",
 		promptSnippet: "独立抓取指定 URL 预览；也可检查 search 选中信源",
 		promptGuidelines: [
@@ -2748,6 +3756,7 @@ export default function (pi: ExtensionAPI) {
 			"Use returned details.metadata for status, final URL, content type, content length, title, description, canonical URL, and binary/large-file decisions.",
 			"Do not treat web_fetch as a browser, JavaScript renderer, login/session tool, bulk downloader, or anti-bot bypass; large/binary targets should be summarized by metadata instead of injected.",
 			"Respect the context budget: fetch one URL at a time, avoid raw/html unless needed, and increase max_output_bytes only when the user explicitly needs more content.",
+			"Use provider=smart_direct for HTML pages where normal direct fetch is noisy or blocked; it uses browser-grade TLS/HTTP fingerprinting plus Defuddle extraction but still does not execute JavaScript.",
 			"If extraction is thin, truncated, blocked, or mismatched, report that limitation and switch back to search or a narrower URL instead of repeatedly fetching broad pages.",
 		],
 		parameters: Type.Object({
@@ -2757,15 +3766,31 @@ export default function (pi: ExtensionAPI) {
 					description: "输出格式。默认 markdown；html/raw/json 仅在需要源码、接口载荷或排错时使用。",
 				}),
 			),
-			max_output_bytes: Type.Optional(
-				Type.Number({ description: "返回内容最大字节数，默认 12000", minimum: 3000, maximum: 51200 }),
+			provider: Type.Optional(
+				StringEnum(WEB_FETCH_PROVIDER_VALUES, {
+					description: "抓取 provider。auto 默认链路：Tavily → Firecrawl → smart_direct → direct。",
+				}),
 			),
+			max_output_bytes: Type.Optional(
+				Type.Number({ description: "返回内容最大字节数，默认 12000；长输出会自动折叠并保存完整文件", minimum: 3000, maximum: 51200 }),
+			),
+			maxChars: Type.Optional(Type.Number({ description: "smart_direct 提取后最大字符数，默认 50000", minimum: 1000, maximum: 200000 })),
+			timeout_ms: Type.Optional(Type.Number({ description: "smart_direct 请求超时毫秒，默认 15000", minimum: 1000, maximum: 120000 })),
+			browser: Type.Optional(Type.String({ description: "smart_direct TLS 指纹浏览器，如 chrome_145 / firefox_147 / safari_26" })),
+			os: Type.Optional(Type.String({ description: "smart_direct OS 指纹：windows / macos / linux / android / ios" })),
+			headers: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "smart_direct 额外请求头" })),
+			remove_images: Type.Optional(Type.Boolean({ description: "smart_direct/Defuddle 是否移除图片，默认 false" })),
+			include_replies: Type.Optional(Type.Any({ description: "smart_direct/Defuddle 回复提取策略：extractors | true | false" })),
+			proxy: Type.Optional(Type.String({ description: "smart_direct 代理 URL" })),
+			verbose: Type.Optional(Type.Boolean({ description: "smart_direct 是否输出完整 metadata header" })),
 		}),
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const config = await configManager.getFullConfig();
 			const maxOutputBytes = clampNumber(params.max_output_bytes, 12000, 3000, 50 * 1024);
 			const format = normalizeWebFetchFormat(params.format);
+			const providerChoice = normalizeWebFetchProviderChoice(params.provider);
+			const smartOptions = resolveSmartDirectOptions(params as Record<string, unknown>);
 			let url: string;
 			try {
 				url = normalizeHttpUrl(params.url);
@@ -2776,41 +3801,91 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 			const endStatus = beginStatus(ctx, formatSearchStatus(config.searchModel));
-			onUpdate?.({ content: [{ type: "text", text: `📄 正在抓取网页 (${format})...` }], details: {} });
+			onUpdate?.({ content: [{ type: "text", text: `📄 正在抓取网页 (${format}/${providerChoice})...` }], details: {} });
 
 			try {
-				if (config.tavilyApiKey) {
-					const result = await tavilyExtract(url, format, signal);
-					if (result) return finishWebFetchResult(result, maxOutputBytes);
+				const attempts: ProviderAttempt[] = [];
+				const finish = async (result: WebFetchResult) => {
+					const finished = await finishWebFetchResult(result, maxOutputBytes);
+					return {
+						...finished,
+						details: {
+							...finished.details,
+							...capabilityDiagnostics(config, attempts, "web_fetch"),
+						},
+					};
+				};
+
+				const auto = providerChoice === "auto";
+				const allowFallback = auto && config.fallbackMode === "auto";
+
+				if ((auto || providerChoice === "tavily") && config.tavilyApiKey) {
+					const result = await withOptionalProviderAttempt(
+						attempts,
+						"web_fetch",
+						"tavily",
+						() => tavilyExtract(url, format, signal),
+					);
+					if (result) return finish(result);
+					if (!auto) return fetchFailure(url, format, providerChoice, config, attempts);
 				}
 
-				if (config.firecrawlApiKey) {
+				if ((allowFallback || providerChoice === "firecrawl") && config.firecrawlApiKey) {
 					onUpdate?.({
 						content: [{ type: "text", text: "📄 Tavily 不适用或失败，尝试 Firecrawl..." }],
 						details: {},
 					});
-					const result = await firecrawlScrape(url, format, signal);
-					if (result) return finishWebFetchResult(result, maxOutputBytes);
+					const result = await withOptionalProviderAttempt(
+						attempts,
+						"web_fetch",
+						"firecrawl",
+						() => firecrawlScrape(url, format, signal),
+					);
+					if (result) return finish(result);
+					if (!auto) return fetchFailure(url, format, providerChoice, config, attempts);
 				}
 
-				onUpdate?.({
-					content: [{ type: "text", text: "📄 提取服务不适用或失败，尝试 direct fetch..." }],
-					details: {},
-				});
-				const directResult = await directFetch(url, format, maxOutputBytes, signal);
-				if (directResult) return finishWebFetchResult(directResult, maxOutputBytes);
+				if ((allowFallback || providerChoice === "smart_direct") && smartDirectSupported(format)) {
+					onUpdate?.({
+						content: [{ type: "text", text: "📄 提取服务不适用或失败，尝试 smart_direct..." }],
+						details: {},
+					});
+					const result = await withOptionalProviderAttempt(
+						attempts,
+						"web_fetch",
+						"smart_direct",
+						() => smartDirectFetch(url, format, smartOptions, signal),
+					);
+					if (result) return finish(result);
+					if (!auto) return fetchFailure(url, format, providerChoice, config, attempts);
+				}
+
+				if (auto || providerChoice === "direct") {
+					onUpdate?.({
+						content: [{ type: "text", text: "📄 smart_direct 不适用或失败，尝试 direct fetch..." }],
+						details: {},
+					});
+					const directResult = await withOptionalProviderAttempt(
+						attempts,
+						"web_fetch",
+						"direct",
+						() => directFetch(url, format, maxOutputBytes, signal),
+					);
+					if (directResult) return finish(directResult);
+				}
 
 				return {
 					content: [
 						{
 							type: "text",
-							text: "提取失败: Tavily/Firecrawl/direct fetch 均未能获取可注入的文本内容。可尝试用 search 搜索相关内容。",
+							text: "提取失败: Tavily/Firecrawl/smart_direct/direct fetch 均未能获取可注入的文本内容。可尝试用 search 搜索相关内容。",
 						},
 					],
 					details: {
 						url,
 						format,
-						error: !config.tavilyApiKey && !config.firecrawlApiKey ? "direct_failed_no_extractors_configured" : "all_failed",
+						error: attempts.length === 0 ? "provider_not_configured_or_unsupported" : "all_failed",
+						...capabilityDiagnostics(config, attempts, "web_fetch"),
 					},
 				};
 			} finally {
@@ -2861,27 +3936,49 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const config = await configManager.getFullConfig();
+			const attempts: ProviderAttempt[] = [];
 			const endStatus = beginStatus(ctx, formatSearchStatus(config.searchModel));
 			try {
-				const result = await tavilyMap(
-					params.url,
-					{
-						instructions: params.instructions,
-						maxDepth: params.max_depth,
-						maxBreadth: params.max_breadth,
-						limit: params.limit ?? 30,
-						timeout: params.timeout,
-					},
-					signal,
-				);
-				const output = await truncateToolOutput(result, "web-map", {
-					maxBytes: clampNumber(params.max_output_bytes, 12000, 3000, 50 * 1024),
-				});
-				const { content, ...outputDetails } = output;
-				return {
-					content: [{ type: "text", text: content }],
-					details: { url: params.url, ...outputDetails },
-				};
+				try {
+					const result = await withProviderAttempt(
+						attempts,
+						"site_map",
+						"tavily",
+						async () => {
+							const mapped = await tavilyMap(
+								params.url,
+								{
+									instructions: params.instructions,
+									maxDepth: params.max_depth,
+									maxBreadth: params.max_breadth,
+									limit: params.limit ?? 30,
+									timeout: params.timeout,
+								},
+								signal,
+							);
+							if (/^(配置错误|映射失败|映射错误):/.test(mapped)) throw new Error(mapped);
+							return mapped;
+						},
+					);
+					const output = await truncateToolOutput(result, "web-map", {
+						maxBytes: clampNumber(params.max_output_bytes, 12000, 3000, 50 * 1024),
+					});
+					const { content, ...outputDetails } = output;
+					return {
+						content: [{ type: "text", text: content }],
+						details: { url: params.url, ...capabilityDiagnostics(config, attempts, "site_map"), ...outputDetails },
+					};
+				} catch (e) {
+					if (e instanceof Error && e.name === "AbortError") throw e;
+					return {
+						content: [{ type: "text", text: `映射失败: ${e instanceof Error ? e.message : String(e)}` }],
+						details: {
+							url: params.url,
+							error: e instanceof Error ? e.message : String(e),
+							...capabilityDiagnostics(config, attempts, "site_map"),
+						},
+					};
+				}
 			} finally {
 				endStatus();
 			}
@@ -2909,52 +4006,93 @@ export default function (pi: ExtensionAPI) {
 					"|--------|-----|",
 					`| Search API URL | ${config.searchApiUrl || "❌ 未配置"} |`,
 					`| Search API Key | ${config.searchApiKey ? configManager.maskKey(config.searchApiKey) : "❌ 未配置"} |`,
-					`| 搜索模型 | ${config.searchModel} |`,
+					`| 搜索模型 | ${config.searchModel || "❌ 未配置"} |`,
 					`| 搜索模式 | ${formatSearchProfile(config.searchProfile)} |`,
+					`| Fallback Mode | ${config.fallbackMode} |`,
+					`| Minimum Profile | ${config.minimumProfile} |`,
 					`| Tavily API URL | ${config.tavilyApiUrl} |`,
 					`| Tavily API Key | ${config.tavilyApiKey ? configManager.maskKey(config.tavilyApiKey) : "❌ 未配置"} |`,
 					`| Firecrawl API URL | ${config.firecrawlApiUrl} |`,
 					`| Firecrawl API Key | ${config.firecrawlApiKey ? configManager.maskKey(config.firecrawlApiKey) : "❌ 未配置"} |`,
+					`| Context7 Base URL | ${config.context7BaseUrl} |`,
+					`| Context7 API Key | ${config.context7ApiKey ? configManager.maskKey(config.context7ApiKey) : "可选/未配置"} |`,
+					`| Exa Base URL | ${config.exaBaseUrl} |`,
+					`| Exa API Key | ${config.exaApiKey ? configManager.maskKey(config.exaApiKey) : "❌ 未配置"} |`,
 					`| 配置文件 | ${configManager.getConfigPath()} |`,
+					"\n## Capability Status\n",
+					"| Capability | Required | Available | Providers |",
+					"|------------|----------|-----------|-----------|",
+					...capabilityStatus(config).map((status) => `| ${status.capability} | ${status.required ? "yes" : "no"} | ${status.available ? "✅" : "❌"} | ${status.providers.map((provider) => `${provider.provider}:${provider.configured ? "on" : "off"}`).join(", ")} |`),
 				];
 
 				return {
 					content: [{ type: "text", text: lines.join("\n") }],
-					details: config,
+					details: { ...config },
 				};
 			}
 
 			if (params.action === "test") {
 				const results: string[] = ["## 连接测试\n"];
+				const attempts: ProviderAttempt[] = [];
 
-				// Test Search Model
 				if (config.searchApiUrl && config.searchApiKey) {
 					try {
 						const start = Date.now();
-						const models = await getAvailableModelsCached(config.searchApiUrl, config.searchApiKey);
-						const elapsed = Date.now() - start;
-						results.push(
-							`✅ **Search API**: 连接成功 (${elapsed}ms)，${models.length} 个模型`,
+						const models = await withProviderAttempt(
+							attempts,
+							"main_search",
+							"openai_compatible",
+							() => getAvailableModelsCached(config.searchApiUrl, config.searchApiKey),
 						);
+						const elapsed = Date.now() - start;
+						results.push(`✅ **Search API**: 连接成功 (${elapsed}ms)，${models.length} 个模型`);
 						if (models.length > 0) {
-							results.push(
-								`   模型: ${models.slice(0, 10).join(", ")}${models.length > 10 ? "..." : ""}`,
-							);
+							results.push(`   模型: ${models.slice(0, 10).join(", ")}${models.length > 10 ? "..." : ""}`);
 						}
 					} catch (e) {
-						results.push(
-							`❌ **Search API**: ${e instanceof Error ? e.message : String(e)}`,
-						);
+						results.push(`❌ **Search API**: ${e instanceof Error ? e.message : String(e)}`);
 					}
 				} else {
 					results.push("⏭️ **Search API**: 未配置");
 				}
 
-				// Test Tavily
+				try {
+					const libraries = await withProviderAttempt(
+						attempts,
+						"docs_search",
+						"context7",
+						() => context7LibrarySearch("react", 1),
+					);
+					results.push(`✅ **Context7**: 连接成功，${libraries.length} 个库结果`);
+				} catch (e) {
+					results.push(`❌ **Context7**: ${e instanceof Error ? e.message : "连接失败"}`);
+				}
+
+				if (config.exaApiKey) {
+					try {
+						const exa = await withProviderAttempt(
+							attempts,
+							"docs_search",
+							"exa",
+							() => exaSearch("react docs", 1),
+						);
+						results.push(`✅ **Exa API**: 连接成功，${exa.length} 个结果`);
+					} catch (e) {
+						results.push(`❌ **Exa API**: ${e instanceof Error ? e.message : "连接失败"}`);
+					}
+				} else {
+					results.push("⏭️ **Exa API**: 未配置");
+				}
+
 				if (config.tavilyApiKey) {
 					try {
-						await tavilySearch("test", 1);
-						results.push("✅ **Tavily API**: 连接成功");
+						const sources = await withProviderAttempt(
+							attempts,
+							"web_search",
+							"tavily",
+							() => tavilySearch("test", 1),
+						);
+						results.push(`✅ **Tavily API**: 连接成功，${sources.length} 个结果`);
 					} catch (e) {
 						results.push(`❌ **Tavily API**: ${e instanceof Error ? e.message : "连接失败"}`);
 					}
@@ -2962,11 +4100,15 @@ export default function (pi: ExtensionAPI) {
 					results.push("⏭️ **Tavily API**: 未配置");
 				}
 
-				// Test Firecrawl
 				if (config.firecrawlApiKey) {
 					try {
-						await firecrawlScrape("https://example.com", "markdown");
-						results.push("✅ **Firecrawl API**: 连接成功");
+						const result = await withOptionalProviderAttempt(
+							attempts,
+							"web_fetch",
+							"firecrawl",
+							() => firecrawlScrape("https://example.com", "markdown"),
+						);
+						results.push(result ? "✅ **Firecrawl API**: 连接成功" : "❌ **Firecrawl API**: 未返回内容");
 					} catch (e) {
 						results.push(`❌ **Firecrawl API**: ${e instanceof Error ? e.message : "连接失败"}`);
 					}
@@ -2974,9 +4116,18 @@ export default function (pi: ExtensionAPI) {
 					results.push("⏭️ **Firecrawl API**: 未配置");
 				}
 
+				const statuses = capabilityStatus(config);
+				results.push("\n## Capability Status");
+				for (const status of statuses) {
+					results.push(`- ${status.available ? "✅" : "❌"} ${status.capability}${status.required ? " (required)" : ""}: ${status.providers.map((provider) => `${provider.provider}:${provider.configured ? "on" : "off"}`).join(", ")}`);
+				}
+				results.push(`\nMinimum profile (${config.minimumProfile}): ${minimumProfileSatisfied(statuses, config.minimumProfile) ? "✅ satisfied" : "❌ missing required capability"}`);
+				results.push(`Fallback mode: ${config.fallbackMode}`);
+				results.push(...providerAttemptsMarkdown(attempts));
+
 				return {
 					content: [{ type: "text", text: results.join("\n") }],
-					details: { tested: true },
+					details: { tested: true, ...capabilityDiagnostics(config, attempts) },
 				};
 			}
 
@@ -3017,6 +4168,20 @@ export default function (pi: ExtensionAPI) {
 						await configManager.setSearchProfile(profile);
 						break;
 					}
+					case "fallbackMode": {
+						if (!(["auto", "off"] as const).includes(params.value as FallbackMode)) {
+							throw new Error("fallbackMode 只能是 auto 或 off");
+						}
+						await configManager.setSearchRuntime("fallbackMode", params.value);
+						break;
+					}
+					case "minimumProfile": {
+						if (!(["standard", "off"] as const).includes(params.value as MinimumProfile)) {
+							throw new Error("minimumProfile 只能是 standard 或 off");
+						}
+						await configManager.setSearchRuntime("minimumProfile", params.value);
+						break;
+					}
 					case "tavilyApiKey":
 						await configManager.setTavily(params.value);
 						break;
@@ -3031,6 +4196,18 @@ export default function (pi: ExtensionAPI) {
 							config.firecrawlApiKey,
 							params.value,
 						);
+						break;
+					case "context7ApiKey":
+						await configManager.setContext7(params.value);
+						break;
+					case "context7BaseUrl":
+						await configManager.setContext7(config.context7ApiKey, params.value);
+						break;
+					case "exaApiKey":
+						await configManager.setExa(params.value);
+						break;
+					case "exaBaseUrl":
+						await configManager.setExa(config.exaApiKey, params.value);
 						break;
 				}
 
@@ -3202,7 +4379,7 @@ export default function (pi: ExtensionAPI) {
 			boundary: Type.String({ description: "What this excludes; should be mutually exclusive with siblings" }),
 			confidence: Type.Optional(Type.Number({ description: "Confidence 0.0-1.0", minimum: 0, maximum: 1 })),
 			depends_on: Type.Optional(Type.Array(Type.String(), { description: "Prerequisite sub-query IDs" })),
-			tool_hint: Type.Optional(StringEnum(["search", "web_fetch", "web_map"] as const)),
+			tool_hint: Type.Optional(StringEnum(["search", "docs_search", "web_fetch", "web_map"] as const)),
 			is_revision: Type.Optional(Type.Boolean({ description: "True to replace all sub-queries" })),
 		}),
 		async execute(_toolCallId, params) {
@@ -3277,7 +4454,7 @@ export default function (pi: ExtensionAPI) {
 			session_id: Type.String({ description: "Session ID from plan_intent" }),
 			thought: Type.String({ description: "Reasoning for this mapping" }),
 			sub_query_id: Type.String({ description: "Sub-query ID to map" }),
-			tool: StringEnum(["search", "web_fetch", "web_map"] as const),
+			tool: StringEnum(["search", "docs_search", "web_fetch", "web_map"] as const),
 			reason: Type.String({ description: "Why this tool for this sub-query" }),
 			confidence: Type.Optional(Type.Number({ description: "Confidence 0.0-1.0", minimum: 0, maximum: 1 })),
 			params_json: Type.Optional(Type.String({ description: "Optional JSON string for tool-specific params" })),
@@ -3416,10 +4593,14 @@ export default function (pi: ExtensionAPI) {
 			const choice = await ctx.ui.select("Pi Search 配置:", [
 				"查看当前配置",
 				"设置 Search API",
+				"设置 Context7 API",
+				"设置 Exa API",
 				"设置 Tavily API",
 				"设置 Firecrawl API",
 				"切换模型",
 				`切换搜索模式 (${SEARCH_PROFILE_DEFS[config.searchProfile].label})`,
+				`切换 Fallback Mode (${config.fallbackMode})`,
+				`切换 Minimum Profile (${config.minimumProfile})`,
 				"测试所有连接",
 			]);
 
@@ -3439,6 +4620,22 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			if (choice.startsWith("切换 Fallback Mode")) {
+				const selected = await ctx.ui.select("Fallback Mode:", ["auto", "off"]);
+				if (!selected) return;
+				await configManager.setSearchRuntime("fallbackMode", selected);
+				ctx.ui.notify(`✅ Fallback Mode 已切换: ${selected}`, "info");
+				return;
+			}
+
+			if (choice.startsWith("切换 Minimum Profile")) {
+				const selected = await ctx.ui.select("Minimum Profile:", ["standard", "off"]);
+				if (!selected) return;
+				await configManager.setSearchRuntime("minimumProfile", selected);
+				ctx.ui.notify(`✅ Minimum Profile 已切换: ${selected}`, "info");
+				return;
+			}
+
 			switch (choice) {
 				case "查看当前配置": {
 					const config = await configManager.getFullConfig();
@@ -3446,6 +4643,10 @@ export default function (pi: ExtensionAPI) {
 						`Search API: ${config.searchApiUrl || "未配置"} | ${config.searchApiKey ? configManager.maskKey(config.searchApiKey) : "未配置"}`,
 						`模型: ${config.searchModel}`,
 						`搜索模式: ${formatSearchProfile(config.searchProfile)}`,
+						`Fallback Mode: ${config.fallbackMode}`,
+						`Minimum Profile: ${config.minimumProfile}`,
+						`Context7: ${config.context7BaseUrl} | ${config.context7ApiKey ? configManager.maskKey(config.context7ApiKey) : "API Key 可选/未配置"}`,
+						`Exa: ${config.exaApiKey ? configManager.maskKey(config.exaApiKey) : "未配置"}`,
 						`Tavily: ${config.tavilyApiKey ? configManager.maskKey(config.tavilyApiKey) : "未配置"}`,
 						`Firecrawl: ${config.firecrawlApiKey ? configManager.maskKey(config.firecrawlApiKey) : "未配置"}`,
 					];
@@ -3463,6 +4664,24 @@ export default function (pi: ExtensionAPI) {
 					if (!key) return;
 					await configManager.setSearchApi(url, key);
 					ctx.ui.notify(`✅ Search API 已配置`, "info");
+					break;
+				}
+
+				case "设置 Context7 API": {
+					const url = await ctx.ui.input("Context7 Base URL:", config.context7BaseUrl);
+					if (!url) return;
+					const key = await ctx.ui.input("Context7 API Key（可留空）:", "");
+					await configManager.setContext7(key || "", url);
+					ctx.ui.notify(`✅ Context7 已配置`, "info");
+					break;
+				}
+
+				case "设置 Exa API": {
+					const key = await ctx.ui.input("Exa API Key:", "");
+					if (!key) return;
+					const url = await ctx.ui.input("Exa Base URL:", config.exaBaseUrl);
+					await configManager.setExa(key, url || config.exaBaseUrl);
+					ctx.ui.notify(`✅ Exa API 已配置`, "info");
 					break;
 				}
 
@@ -3513,13 +4732,16 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify("正在测试连接...", "info");
 					const results: string[] = [];
 					const config = await configManager.getFullConfig();
+					const attempts: ProviderAttempt[] = [];
 
 					if (config.searchApiUrl && config.searchApiKey) {
 						try {
 							const start = Date.now();
-							const models = await getAvailableModelsCached(
-								config.searchApiUrl,
-								config.searchApiKey,
+							const models = await withProviderAttempt(
+								attempts,
+								"main_search",
+								"openai_compatible",
+								() => getAvailableModelsCached(config.searchApiUrl, config.searchApiKey),
 							);
 							const elapsed = Date.now() - start;
 							results.push(`✅ Search API: ${elapsed}ms, ${models.length} 模型`);
@@ -3530,14 +4752,39 @@ export default function (pi: ExtensionAPI) {
 						results.push("⏭️ Search API: 未配置");
 					}
 
-					results.push(
-						config.tavilyApiKey ? "✅ Tavily: 已配置" : "⏭️ Tavily: 未配置",
-					);
-					results.push(
-						config.firecrawlApiKey
-							? "✅ Firecrawl: 已配置"
-							: "⏭️ Firecrawl: 未配置",
-					);
+					try {
+						const libraries = await withProviderAttempt(
+							attempts,
+							"docs_search",
+							"context7",
+							() => context7LibrarySearch("react", 1),
+						);
+						results.push(`✅ Context7: ${libraries.length} 库结果`);
+					} catch {
+						results.push("❌ Context7: 连接失败");
+					}
+
+					if (config.exaApiKey) {
+						try {
+							const exa = await withProviderAttempt(
+								attempts,
+								"docs_search",
+								"exa",
+								() => exaSearch("react docs", 1),
+							);
+							results.push(`✅ Exa: ${exa.length} 结果`);
+						} catch {
+							results.push("❌ Exa: 连接失败");
+						}
+					} else {
+						results.push("⏭️ Exa: 未配置");
+					}
+
+					results.push(config.tavilyApiKey ? "✅ Tavily: 已配置" : "⏭️ Tavily: 未配置");
+					results.push(config.firecrawlApiKey ? "✅ Firecrawl: 已配置" : "⏭️ Firecrawl: 未配置");
+					results.push(`Fallback: ${config.fallbackMode}`);
+					results.push(`Minimum Profile: ${minimumProfileSatisfied(capabilityStatus(config), config.minimumProfile) ? "✅" : "❌"} ${config.minimumProfile}`);
+					results.push(...providerAttemptsMarkdown(attempts));
 
 					ctx.ui.notify(results.join("\n"), "info");
 					break;

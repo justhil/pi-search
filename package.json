@@ -2,7 +2,13 @@
   "name": "pi-search",
   "version": "2.0.0",
   "description": "Generic Search Extension for pi - 搜索模型 API + Tavily 抓取 + Firecrawl 托底",
-  "keywords": ["pi-package", "pi-extension", "search", "tavily", "firecrawl"],
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "search",
+    "tavily",
+    "firecrawl"
+  ],
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -10,7 +16,9 @@
     "url": "https://github.com/justhil/pi-search.git"
   },
   "pi": {
-    "extensions": ["./index.ts"],
+    "extensions": [
+      "./index.ts"
+    ],
     "image": "https://raw.githubusercontent.com/justhil/pi-search/main/screenshot.png"
   },
   "peerDependencies": {
@@ -20,8 +28,19 @@
     "typebox": "*"
   },
   "scripts": {
-    "clean": "echo 'nothing to clean'",
-    "build": "echo 'nothing to build'"
+    "clean": "rm -rf dist coverage",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "tsc --noEmit"
   },
-  "dependencies": {}
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "typescript": "^6.0.3",
+    "vitest": "^2.1.9"
+  },
+  "dependencies": {
+    "defuddle": "^0.18.1",
+    "linkedom": "^0.18.12",
+    "wreq-js": "^2.3.1"
+  }
 }
