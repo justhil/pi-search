@@ -88,6 +88,9 @@ const ENV_KEYS = [
 	"EXA_BASE_URL",
 	"SEARCH_DEBUG",
 	"PI_SEARCH_CONFIG_PATH",
+	"PI_SEARCH_CONTEXT7_CACHE_DIR",
+	"CONTEXT7_RESOLVE_TTL_HOURS",
+	"CONTEXT7_DOCS_TTL_HOURS",
 ];
 
 const originalFetch = globalThis.fetch;
@@ -154,7 +157,9 @@ beforeEach(() => {
 	process.env.EXA_BASE_URL = "https://exa.test";
 	process.env.SEARCH_FALLBACK_MODE = "auto";
 	process.env.SEARCH_MINIMUM_PROFILE = "standard";
-	process.env.PI_SEARCH_CONFIG_PATH = `.pi/tmp/test-config-${process.pid}-${Date.now()}-${Math.random()}.json`;
+	const testId = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+	process.env.PI_SEARCH_CONFIG_PATH = `.pi/tmp/test-config-${testId}/config.json`;
+	process.env.PI_SEARCH_CONTEXT7_CACHE_DIR = `.pi/tmp/test-config-${testId}/context7-cache`;
 });
 
 afterEach(() => {
@@ -169,6 +174,10 @@ describe("pi-search extension", () => {
 
 		expect([...pi.tools.keys()]).toEqual(expect.arrayContaining([
 			"search",
+			"context7_resolve_library_id",
+			"context7_query_docs",
+			"context7_get_library_docs",
+			"context7_get_cached_doc_raw",
 			"docs_search",
 			"search_sources",
 			"web_fetch",
@@ -177,6 +186,141 @@ describe("pi-search extension", () => {
 			"search_planning",
 			"plan_tool_mapping",
 		]));
+	});
+
+	it("resolves Context7 library IDs like the official MCP flow", async () => {
+		const fetchMock = vi.fn(async (input: Parameters<typeof fetch>[0]) => {
+			const url = String(input);
+			if (url.startsWith("https://context7.test/api/v2/search")) {
+				return jsonResponse({
+					results: [
+						{ id: "/react/react", title: "React", description: "React official docs", trustScore: 9, benchmarkScore: 95, totalSnippets: 1200 },
+					],
+				});
+			}
+			throw new Error(`Unhandled fetch: ${url}`);
+		}) as typeof fetch;
+		globalThis.fetch = fetchMock;
+
+		const result = await runTool(installExtension(), "context7_resolve_library_id", {
+			libraryName: "React",
+			query: "useEffect cleanup",
+		});
+
+		expect(result.content[0]?.text).toContain("Selected Library ID");
+		expect(result.content[0]?.text).toContain("/react/react");
+		expect(result.details?.selected_library_id).toBe("/react/react");
+		expect(result.details?.provider_attempts).toEqual([
+			expect.objectContaining({ capability: "docs_search", provider: "context7", ok: true }),
+		]);
+	});
+
+	it("queries Context7 docs directly with a library ID", async () => {
+		const fetchMock = vi.fn(async (input: Parameters<typeof fetch>[0]) => {
+			const url = String(input);
+			if (url.startsWith("https://context7.test/api/v2/context")) {
+				return jsonResponse({
+					codeSnippets: [{ title: "useEffect cleanup", content: "return () => unsubscribe();" }],
+					infoSnippets: [{ title: "Cleanup", content: "Cleanup runs before unmount and before the next effect." }],
+				});
+			}
+			throw new Error(`Unhandled fetch: ${url}`);
+		}) as typeof fetch;
+		globalThis.fetch = fetchMock;
+
+		const result = await runTool(installExtension(), "context7_query_docs", {
+			libraryId: "/react/react",
+			query: "useEffect cleanup",
+		});
+
+		expect(result.content[0]?.text).toContain("useEffect cleanup");
+		expect(result.content[0]?.text).toContain("return () => unsubscribe();");
+		expect(result.details?.library_id).toBe("/react/react");
+		expect(result.details?.snippets_count).toBe(2);
+		expect(result.details?.provider_attempts).toEqual([
+			expect.objectContaining({ capability: "docs_search", provider: "context7_docs", ok: true }),
+		]);
+	});
+
+	it("caches Context7 docs and reuses the cached doc_ref", async () => {
+		const fetchMock = vi.fn(async (input: Parameters<typeof fetch>[0]) => {
+			const url = String(input);
+			if (url.startsWith("https://context7.test/api/v2/context")) {
+				return jsonResponse({
+					codeSnippets: [{ title: "useEffect cleanup", content: "cached cleanup snippet" }],
+					infoSnippets: [],
+				});
+			}
+			throw new Error(`Unhandled fetch: ${url}`);
+		}) as typeof fetch;
+		globalThis.fetch = fetchMock;
+		const pi = installExtension();
+
+		const first = await runTool(pi, "context7_query_docs", {
+			libraryId: "/react/react",
+			query: "useEffect cleanup",
+		});
+		const second = await runTool(pi, "context7_query_docs", {
+			libraryId: "/react/react",
+			query: "useEffect cleanup",
+		});
+
+		expect(first.details?.cache).toBe("miss");
+		expect(second.details?.cache).toBe("hit");
+		expect(second.details?.doc_ref).toBe(first.details?.doc_ref);
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(second.details?.provider_attempts).toEqual([
+			expect.objectContaining({ capability: "docs_search", provider: "context7_cache", ok: true }),
+		]);
+	});
+
+	it("auto-resolves Context7 library docs and exposes raw cached documents", async () => {
+		const fetchMock = vi.fn(async (input: Parameters<typeof fetch>[0]) => {
+			const url = String(input);
+			if (url.startsWith("https://context7.test/api/v2/search")) {
+				return jsonResponse({
+					results: [
+						{ id: "/react/react", title: "React", description: "React docs", trustScore: 9, versions: ["19.0.0"] },
+					],
+				});
+			}
+			if (url.startsWith("https://context7.test/api/v2/context")) {
+				return jsonResponse({
+					codeSnippets: [{ title: "useEffect cleanup", content: "auto resolved cleanup snippet" }],
+					infoSnippets: [{ title: "Effect lifecycle", content: "Effects can return cleanup functions." }],
+				});
+			}
+			throw new Error(`Unhandled fetch: ${url}`);
+		}) as typeof fetch;
+		globalThis.fetch = fetchMock;
+		const pi = installExtension();
+
+		const docs = await runTool(pi, "context7_get_library_docs", {
+			libraryName: "React",
+			query: "useEffect cleanup",
+		});
+		const docRef = String(docs.details?.doc_ref);
+		const raw = await runTool(pi, "context7_get_cached_doc_raw", { docRef });
+		const semantic = await runTool(pi, "context7_get_cached_doc_raw", {
+			query: "cleanup lifecycle",
+			libraryId: "/react/react",
+		});
+
+		expect(docs.content[0]?.text).toContain("auto resolved cleanup snippet");
+		expect(docs.content[0]?.text).toContain("Raw cached document available via docRef");
+		expect(docs.details?.library_id).toBe("/react/react");
+		expect(docs.details?.resolve_cache).toBe("miss");
+		expect(docs.details?.docs_cache).toBe("miss");
+		expect(docs.details?.provider_attempts).toEqual(expect.arrayContaining([
+			expect.objectContaining({ capability: "docs_search", provider: "context7", ok: true }),
+			expect.objectContaining({ capability: "docs_search", provider: "context7_docs", ok: true }),
+		]));
+		expect(raw.content[0]?.text).toContain('"docRef"');
+		expect(raw.content[0]?.text).toContain("auto resolved cleanup snippet");
+		expect(raw.details?.cache).toBe("hit");
+		expect(raw.details?.doc_ref).toBe(docRef);
+		expect(semantic.details?.doc_ref).toBe(docRef);
+		expect(fetchMock).toHaveBeenCalledTimes(2);
 	});
 
 	it("returns Context7 and Exa docs_search results with provider diagnostics", async () => {

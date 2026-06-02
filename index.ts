@@ -28,7 +28,8 @@ import type { DefuddleResponse } from "defuddle/node";
 import { parseHTML } from "linkedom";
 import { fetch as wreqFetch } from "wreq-js";
 import type { BrowserProfile, EmulationOS, RequestInit as WreqRequestInit } from "wreq-js";
-import { appendFile, readFile, writeFile, mkdir } from "node:fs/promises";
+import { appendFile, readFile, writeFile, mkdir, readdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 
@@ -47,6 +48,8 @@ const SEARCH_PROFILE_VALUES = [
 
 type SearchProfile = (typeof SEARCH_PROFILE_VALUES)[number];
 const DEFAULT_SEARCH_API_URL = "https://api.openai.com/v1";
+const CONTEXT7_DEFAULT_RESOLVE_TTL_HOURS = 168;
+const CONTEXT7_DEFAULT_DOCS_TTL_HOURS = 24;
 
 interface SearchConfigFile {
 	apiUrl?: string;
@@ -61,6 +64,8 @@ interface SearchConfigFile {
 	firecrawlApiUrl?: string;
 	context7ApiKey?: string;
 	context7BaseUrl?: string;
+	context7ResolveTtlHours?: number;
+	context7DocsTtlHours?: number;
 	exaApiKey?: string;
 	exaBaseUrl?: string;
 }
@@ -78,6 +83,8 @@ interface RuntimeConfig {
 	firecrawlApiKey: string;
 	context7BaseUrl: string;
 	context7ApiKey: string;
+	context7ResolveTtlHours: number;
+	context7DocsTtlHours: number;
 	exaBaseUrl: string;
 	exaApiKey: string;
 }
@@ -562,6 +569,16 @@ class ConfigManager {
 				file.context7BaseUrl ||
 				"https://context7.com",
 			context7ApiKey: process.env.CONTEXT7_API_KEY || file.context7ApiKey || "",
+			context7ResolveTtlHours: normalizePositiveNumber(
+				process.env.CONTEXT7_RESOLVE_TTL_HOURS,
+				file.context7ResolveTtlHours,
+				CONTEXT7_DEFAULT_RESOLVE_TTL_HOURS,
+			),
+			context7DocsTtlHours: normalizePositiveNumber(
+				process.env.CONTEXT7_DOCS_TTL_HOURS,
+				file.context7DocsTtlHours,
+				CONTEXT7_DEFAULT_DOCS_TTL_HOURS,
+			),
 			exaBaseUrl:
 				process.env.EXA_BASE_URL ||
 				file.exaBaseUrl ||
@@ -610,6 +627,17 @@ class ConfigManager {
 		await this.saveFile(file);
 	}
 
+	async setContext7Cache(key: "context7ResolveTtlHours" | "context7DocsTtlHours", value: number): Promise<void> {
+		const file = await this.loadFile();
+		const fallback = key === "context7ResolveTtlHours"
+			? CONTEXT7_DEFAULT_RESOLVE_TTL_HOURS
+			: CONTEXT7_DEFAULT_DOCS_TTL_HOURS;
+		file[key] = Number.isFinite(value) && value > 0
+			? Math.floor(value)
+			: normalizePositiveNumber(undefined, file[key], fallback);
+		await this.saveFile(file);
+	}
+
 	async setExa(key: string, url?: string): Promise<void> {
 		const file = await this.loadFile();
 		file.exaApiKey = key;
@@ -647,6 +675,258 @@ class ConfigManager {
 }
 
 const configManager = new ConfigManager();
+
+// =============================================================================
+// Context7 Persistent Cache
+// =============================================================================
+
+interface Context7ResolveCacheEntry {
+	kind: "resolve";
+	query: string;
+	maxResults: number;
+	createdAt: string;
+	expiresAt: string;
+	libraries: Context7LibraryItem[];
+}
+
+interface Context7DocsCacheEntry {
+	kind: "docs";
+	docRef: string;
+	libraryId: string;
+	query: string;
+	createdAt: string;
+	expiresAt: string;
+	snippets: unknown[];
+	raw: unknown;
+}
+
+type Context7CacheState = "hit" | "miss" | "refresh" | "stale";
+
+function context7CacheRoot(): string {
+	const configured = process.env.PI_SEARCH_CONTEXT7_CACHE_DIR || process.env.CONTEXT7_CACHE_DIR;
+	return configured || join(dirname(configManager.getConfigPath()), "context7-cache");
+}
+
+function context7CacheHash(value: string): string {
+	return createHash("sha256").update(value).digest("hex").slice(0, 16);
+}
+
+function context7ResolveCachePath(query: string): string {
+	return join(context7CacheRoot(), "resolve", `${context7CacheHash(query.trim().toLowerCase())}.json`);
+}
+
+function normalizeContext7LibraryId(value: string): string {
+	const trimmed = value.trim();
+	if (!trimmed) return trimmed;
+	if (/^https?:\/\//.test(trimmed)) {
+		try {
+			const url = new URL(trimmed);
+			return `/${url.pathname.replace(/^\/+/, "").replace(/\/+$/, "")}`;
+		} catch {
+			return trimmed;
+		}
+	}
+	return trimmed.startsWith("/") ? trimmed : trimmed;
+}
+
+function isContext7LibraryId(value: string): boolean {
+	const trimmed = value.trim();
+	return /^\/[^\s/]+\/[^\s]+/.test(trimmed) || /^https?:\/\/[^\s]+\/[^\s/]+\/[^\s]+/.test(trimmed);
+}
+
+function context7DocRef(libraryId: string, query: string): string {
+	return `ctx7_${context7CacheHash(`${normalizeContext7LibraryId(libraryId)}\n${query.trim().toLowerCase()}`)}`;
+}
+
+function context7DocsCachePath(docRef: string): string {
+	return join(context7CacheRoot(), "docs", `${docRef.replace(/[^a-z0-9_-]/gi, "_")}.json`);
+}
+
+function context7ExpiresAt(ttlHours: number): string {
+	return new Date(Date.now() + Math.max(1, ttlHours) * 60 * 60 * 1000).toISOString();
+}
+
+function context7CacheFresh(entry: { expiresAt?: string }): boolean {
+	return !!entry.expiresAt && Date.parse(entry.expiresAt) > Date.now();
+}
+
+async function readJsonCache<T>(path: string): Promise<T | null> {
+	try {
+		return JSON.parse(await readFile(path, "utf8")) as T;
+	} catch {
+		return null;
+	}
+}
+
+async function writeJsonCache(path: string, value: unknown): Promise<void> {
+	await mkdir(dirname(path), { recursive: true });
+	await writeFile(path, JSON.stringify(value, null, 2), "utf8");
+}
+
+function pushCacheAttempt(attempts: ProviderAttempt[], provider: string, ok = true, error?: string): void {
+	attempts.push({
+		provider,
+		capability: "docs_search",
+		ok,
+		latencyMs: 0,
+		...(error ? { error } : {}),
+	});
+}
+
+function context7SnippetsFromData(data: unknown): unknown[] {
+	if (!isRecord(data)) return [];
+	const code = Array.isArray(data.codeSnippets) ? data.codeSnippets : [];
+	const info = Array.isArray(data.infoSnippets) ? data.infoSnippets : [];
+	return [...code, ...info];
+}
+
+async function getContext7LibrariesCached(
+	query: string,
+	maxResults: number,
+	forceRefresh: boolean,
+	signal: AbortSignal | undefined,
+	attempts: ProviderAttempt[],
+): Promise<{ libraries: Context7LibraryItem[]; cache: Context7CacheState; cachePath: string }> {
+	const config = await configManager.getFullConfig();
+	const cachePath = context7ResolveCachePath(query);
+	const cached = await readJsonCache<Context7ResolveCacheEntry>(cachePath);
+	const usableCache = cached?.kind === "resolve" && cached.maxResults >= maxResults;
+	if (!forceRefresh && usableCache && context7CacheFresh(cached)) {
+		pushCacheAttempt(attempts, "context7_cache");
+		return { libraries: cached.libraries.slice(0, maxResults), cache: "hit", cachePath };
+	}
+
+	try {
+		const libraries = await withProviderAttempt(
+			attempts,
+			"docs_search",
+			"context7",
+			() => context7LibrarySearch(query, maxResults, signal),
+		);
+		const entry: Context7ResolveCacheEntry = {
+			kind: "resolve",
+			query,
+			maxResults,
+			createdAt: new Date().toISOString(),
+			expiresAt: context7ExpiresAt(config.context7ResolveTtlHours),
+			libraries,
+		};
+		await writeJsonCache(cachePath, entry);
+		return { libraries, cache: usableCache ? "refresh" : "miss", cachePath };
+	} catch (e) {
+		if (!forceRefresh && usableCache) {
+			pushCacheAttempt(attempts, "context7_cache_stale");
+			return { libraries: cached.libraries.slice(0, maxResults), cache: "stale", cachePath };
+		}
+		throw e;
+	}
+}
+
+async function getContext7DocsCached(
+	libraryId: string,
+	query: string,
+	forceRefresh: boolean,
+	signal: AbortSignal | undefined,
+	attempts: ProviderAttempt[],
+): Promise<{ entry: Context7DocsCacheEntry; cache: Context7CacheState; cachePath: string }> {
+	const config = await configManager.getFullConfig();
+	const normalizedLibraryId = normalizeContext7LibraryId(libraryId);
+	const docRef = context7DocRef(normalizedLibraryId, query);
+	const cachePath = context7DocsCachePath(docRef);
+	const cached = await readJsonCache<Context7DocsCacheEntry>(cachePath);
+	const usableCache = cached?.kind === "docs";
+	if (!forceRefresh && usableCache && context7CacheFresh(cached)) {
+		pushCacheAttempt(attempts, "context7_cache");
+		return { entry: cached, cache: "hit", cachePath };
+	}
+
+	try {
+		const raw = await withProviderAttempt(
+			attempts,
+			"docs_search",
+			"context7_docs",
+			() => context7DocsRaw(normalizedLibraryId, query, signal),
+		);
+		const entry: Context7DocsCacheEntry = {
+			kind: "docs",
+			docRef,
+			libraryId: normalizedLibraryId,
+			query,
+			createdAt: new Date().toISOString(),
+			expiresAt: context7ExpiresAt(config.context7DocsTtlHours),
+			snippets: context7SnippetsFromData(raw),
+			raw,
+		};
+		await writeJsonCache(cachePath, entry);
+		return { entry, cache: usableCache ? "refresh" : "miss", cachePath };
+	} catch (e) {
+		if (!forceRefresh && usableCache) {
+			pushCacheAttempt(attempts, "context7_cache_stale");
+			return { entry: cached, cache: "stale", cachePath };
+		}
+		throw e;
+	}
+}
+
+async function listContext7DocsCacheEntries(): Promise<Context7DocsCacheEntry[]> {
+	const dir = join(context7CacheRoot(), "docs");
+	let files: string[] = [];
+	try {
+		files = await readdir(dir);
+	} catch {
+		return [];
+	}
+	const entries = await Promise.all(
+		files
+			.filter((file) => file.endsWith(".json"))
+			.map((file) => readJsonCache<Context7DocsCacheEntry>(join(dir, file))),
+	);
+	return entries.filter((entry): entry is Context7DocsCacheEntry => !!entry && entry.kind === "docs");
+}
+
+function scoreContext7CachedDoc(entry: Context7DocsCacheEntry, query: string, libraryId?: string): number {
+	let score = 0;
+	const haystack = `${entry.libraryId}\n${entry.query}\n${JSON.stringify(entry.snippets)}`.toLowerCase();
+	if (libraryId && normalizeContext7LibraryId(libraryId).toLowerCase() === entry.libraryId.toLowerCase()) score += 50;
+	for (const term of query.toLowerCase().split(/\W+/).filter((term) => term.length > 2)) {
+		if (haystack.includes(term)) score += 1;
+	}
+	if (context7CacheFresh(entry)) score += 5;
+	return score;
+}
+
+async function findContext7CachedDoc(query: string, libraryId?: string): Promise<Context7DocsCacheEntry | null> {
+	const entries = await listContext7DocsCacheEntries();
+	let best: Context7DocsCacheEntry | null = null;
+	let bestScore = 0;
+	for (const entry of entries) {
+		const score = scoreContext7CachedDoc(entry, query, libraryId);
+		if (score > bestScore) {
+			best = entry;
+			bestScore = score;
+		}
+	}
+	return best;
+}
+
+function formatContext7DocsEntry(entry: Context7DocsCacheEntry, maxSnippets: number, raw: boolean): string {
+	if (raw) return JSON.stringify(entry, null, 2);
+	const sections = [
+		`## Context7 Docs: ${entry.libraryId}`,
+		`\nQuery: ${entry.query}`,
+		`DocRef: \`${entry.docRef}\``,
+		`Cache expires: ${entry.expiresAt}`,
+	];
+	const visible = entry.snippets.slice(0, maxSnippets);
+	if (visible.length > 0) {
+		sections.push("\n### Snippets");
+		for (const snippet of visible) sections.push(`\n${formatContext7Snippet(snippet)}`);
+	} else {
+		sections.push("\n未返回 Context7 文档片段。请检查 libraryId，或换一个更具体的 query。");
+	}
+	if (entry.snippets.length > visible.length) sections.push(`\n还有 ${entry.snippets.length - visible.length} 个片段未显示，可提高 max_snippets，或用 context7_get_cached_doc_raw 读取完整缓存。`);
+	return sections.join("\n");
+}
 
 function normalizeSearchModel(model: string, apiUrl: string): string {
 	if (!model.trim()) return "";
@@ -1080,6 +1360,13 @@ function normalizeFallbackMode(value: unknown): FallbackMode {
 
 function normalizeMinimumProfile(value: unknown): MinimumProfile {
 	return value === "off" ? "off" : "standard";
+}
+
+function normalizePositiveNumber(envValue: string | undefined, fileValue: number | undefined, fallback: number): number {
+	const value = envValue !== undefined ? Number(envValue) : fileValue;
+	return typeof value === "number" && Number.isFinite(value) && value > 0
+		? Math.floor(value)
+		: fallback;
 }
 
 function formatSearchProfile(profile: SearchProfile): string {
@@ -2010,6 +2297,7 @@ interface Context7LibraryItem {
 	benchmarkScore?: number;
 	totalSnippets?: number;
 	stars?: number;
+	versions?: string[];
 }
 
 interface ExaResultItem {
@@ -2079,14 +2367,15 @@ async function context7LibrarySearch(
 			benchmarkScore: typeof item.benchmarkScore === "number" ? item.benchmarkScore : undefined,
 			totalSnippets: typeof item.totalSnippets === "number" ? item.totalSnippets : undefined,
 			stars: typeof item.stars === "number" ? item.stars : undefined,
+			versions: Array.isArray(item.versions) ? item.versions.filter((version): version is string => typeof version === "string") : undefined,
 		}));
 }
 
-async function context7Docs(
+async function context7DocsRaw(
 	libraryId: string,
 	query: string,
 	signal?: AbortSignal,
-): Promise<unknown[]> {
+): Promise<unknown> {
 	const config = await configManager.getFullConfig();
 	const endpoint = `${config.context7BaseUrl.replace(/\/+$/, "")}/api/v2/context?libraryId=${encodeURIComponent(libraryId)}&query=${encodeURIComponent(query)}`;
 	const response = await fetchWithRetry(
@@ -2096,11 +2385,15 @@ async function context7Docs(
 			signal: createTimeoutSignal(DEFAULT_REQUEST_TIMEOUT_MS, signal),
 		},
 	);
-	const data = await response.json().catch(async () => ({ content: await response.text() })) as unknown;
-	if (!isRecord(data)) return [];
-	const code = Array.isArray(data.codeSnippets) ? data.codeSnippets : [];
-	const info = Array.isArray(data.infoSnippets) ? data.infoSnippets : [];
-	return [...code, ...info];
+	return response.json().catch(async () => ({ content: await response.text() })) as Promise<unknown>;
+}
+
+async function context7Docs(
+	libraryId: string,
+	query: string,
+	signal?: AbortSignal,
+): Promise<unknown[]> {
+	return context7SnippetsFromData(await context7DocsRaw(libraryId, query, signal));
 }
 
 function context7LibraryUrl(baseUrl: string, id: string | undefined): string {
@@ -3302,6 +3595,8 @@ const searchConfigParameters = Type.Object({
 			"firecrawlApiUrl",
 			"context7ApiKey",
 			"context7BaseUrl",
+			"context7ResolveTtlHours",
+			"context7DocsTtlHours",
 			"exaApiKey",
 			"exaBaseUrl",
 		] as const),
@@ -3578,6 +3873,304 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(
 					`搜索失败: ${e instanceof Error ? e.message : String(e)}`,
 				);
+			} finally {
+				endStatus();
+			}
+		},
+	});
+
+	// =========================================================================
+	// Tool: context7_resolve_library_id — 快速解析 Context7 library id
+	// =========================================================================
+	pi.registerTool({
+		name: "context7_resolve_library_id",
+		label: "Context7 Resolve Library ID",
+		description:
+			"解析包名/产品名到 Context7-compatible library ID。\n" +
+			"参考官方 Context7 MCP：查询文档前先解析 libraryId；如果用户已提供 /org/project 或 /org/project/version，可直接调用 context7_query_docs。",
+		promptSnippet: "解析 Context7 library ID，用于后续 context7_query_docs",
+		promptGuidelines: [
+			"Use context7_resolve_library_id before context7_query_docs unless the user already provided a Context7 library ID like /org/project or /org/project/version.",
+			"Choose the best match by exact name, description relevance, trust score, benchmark score and snippet coverage.",
+			"Do not use this tool for broad web research; it is Context7-only documentation lookup.",
+		],
+		parameters: Type.Object({
+			libraryName: Type.String({ description: "Library/package/product name, e.g. React, Next.js, Supabase" }),
+			query: Type.Optional(Type.String({ description: "User task/query used to rank relevance; defaults to libraryName" })),
+			max_results: Type.Optional(Type.Number({ description: "最大候选数（1-20），默认 8", minimum: 1, maximum: 20 })),
+			force_refresh: Type.Optional(Type.Boolean({ description: "跳过 Context7 本地缓存，强制重新请求" })),
+			max_output_bytes: Type.Optional(Type.Number({ description: "返回内容最大字节数，默认 12000", minimum: 3000, maximum: 51200 })),
+		}),
+
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const config = await configManager.getFullConfig();
+			const attempts: ProviderAttempt[] = [];
+			const endStatus = beginStatus(ctx, "Context7 Resolve");
+			try {
+				const maxResults = clampNumber(params.max_results, 8, 1, 20);
+				const searchQuery = params.query ? `${params.libraryName} ${params.query}` : params.libraryName;
+				const resolved = await getContext7LibrariesCached(searchQuery, maxResults, !!params.force_refresh, signal, attempts);
+				const libraries = resolved.libraries;
+				const selected = libraries.find((item) => item.id) || libraries[0];
+				const sections = [`## Context7 Resolve Library ID: ${params.libraryName}`];
+				if (selected?.id) {
+					sections.push(
+						"\n### Selected Library ID",
+						`\`${selected.id}\``,
+						selected.title ? `\n**Name**: ${selected.title}` : "",
+						selected.description ? `\n${selected.description}` : "",
+						"\nUse this ID with `context7_query_docs`.",
+					);
+				} else {
+					sections.push("\n未找到明确匹配。请尝试更准确的官方库名。 ");
+				}
+				if (libraries.length > 0) {
+					sections.push("\n### Candidates");
+					for (const item of libraries) {
+						const meta = [
+							item.trustScore !== undefined ? `trust=${item.trustScore}` : "",
+							item.benchmarkScore !== undefined ? `benchmark=${item.benchmarkScore}` : "",
+							item.totalSnippets !== undefined ? `snippets=${item.totalSnippets}` : "",
+							item.stars !== undefined ? `stars=${item.stars}` : "",
+							item.versions?.length ? `versions=${item.versions.slice(0, 3).join(",")}` : "",
+						].filter(Boolean).join(", ");
+						sections.push(`- \`${item.id || "unknown"}\` — ${item.title || "Untitled"}${meta ? ` (${meta})` : ""}${item.description ? ` — ${item.description}` : ""}`);
+					}
+				}
+				sections.push(...providerAttemptsMarkdown(attempts));
+
+				const rendered = await truncateToolOutput(sections.filter(Boolean).join("\n"), "context7-resolve", {
+					maxBytes: clampNumber(params.max_output_bytes, 12000, 3000, 50 * 1024),
+				});
+				const { content, ...outputDetails } = rendered;
+				return {
+					content: [{ type: "text", text: content }],
+					details: {
+						selected_library_id: selected?.id,
+						libraries_count: libraries.length,
+						base_url: config.context7BaseUrl,
+						cache: resolved.cache,
+						cache_path: resolved.cachePath,
+						...capabilityDiagnostics(config, attempts, "docs_search"),
+						...outputDetails,
+					},
+				};
+			} finally {
+				endStatus();
+			}
+		},
+	});
+
+	// =========================================================================
+	// Tool: context7_query_docs — 快速查询 Context7 文档
+	// =========================================================================
+	pi.registerTool({
+		name: "context7_query_docs",
+		label: "Context7 Query Docs",
+		description:
+			"使用 Context7 libraryId 查询最新文档和代码片段。\n" +
+			"参考官方 Context7 MCP：除非用户直接提供 /org/project 或 /org/project/version，否则应先调用 context7_resolve_library_id。",
+		promptSnippet: "用 Context7 libraryId 查询官方文档和代码片段",
+		promptGuidelines: [
+			"Use context7_query_docs when you already have an exact Context7 library ID such as /vercel/next.js or /react/react.",
+			"Call context7_resolve_library_id first when the user only names a package or product.",
+			"Be specific in the query, e.g. authentication with JWT, React useEffect cleanup, migration from v4 to v5.",
+		],
+		parameters: Type.Object({
+			libraryId: Type.String({ description: "Exact Context7-compatible library ID, e.g. /vercel/next.js or /supabase/supabase" }),
+			query: Type.String({ description: "具体文档问题或任务" }),
+			max_snippets: Type.Optional(Type.Number({ description: "最大片段数（1-20），默认 5", minimum: 1, maximum: 20 })),
+			raw: Type.Optional(Type.Boolean({ description: "返回原始缓存 JSON（包含 raw/snippets/docRef）" })),
+			force_refresh: Type.Optional(Type.Boolean({ description: "跳过 Context7 本地缓存，强制重新请求" })),
+			max_output_bytes: Type.Optional(Type.Number({ description: "返回内容最大字节数，默认 12000", minimum: 3000, maximum: 51200 })),
+		}),
+
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const config = await configManager.getFullConfig();
+			const attempts: ProviderAttempt[] = [];
+			const endStatus = beginStatus(ctx, "Context7 Docs");
+			try {
+				const maxSnippets = clampNumber(params.max_snippets, 5, 1, 20);
+				const cached = await getContext7DocsCached(params.libraryId, params.query, !!params.force_refresh, signal, attempts);
+				const entry = cached.entry;
+				const sections = [formatContext7DocsEntry(entry, maxSnippets, !!params.raw)];
+				if (!params.raw) sections.push(`\nLibrary URL: ${context7LibraryUrl(config.context7BaseUrl, entry.libraryId)}`);
+				sections.push(...providerAttemptsMarkdown(attempts));
+
+				const rendered = await truncateToolOutput(sections.join("\n"), "context7-docs", {
+					maxBytes: clampNumber(params.max_output_bytes, 12000, 3000, 50 * 1024),
+					extension: params.raw ? "json" : "md",
+				});
+				const { content, ...outputDetails } = rendered;
+				return {
+					content: [{ type: "text", text: content }],
+					details: {
+						library_id: entry.libraryId,
+						doc_ref: entry.docRef,
+						snippets_count: entry.snippets.length,
+						cache: cached.cache,
+						cache_path: cached.cachePath,
+						library_url: context7LibraryUrl(config.context7BaseUrl, entry.libraryId),
+						...capabilityDiagnostics(config, attempts, "docs_search"),
+						...outputDetails,
+					},
+				};
+			} finally {
+				endStatus();
+			}
+		},
+	});
+
+	// =========================================================================
+	// Tool: context7_get_library_docs — 自动解析并获取 Context7 文档
+	// =========================================================================
+	pi.registerTool({
+		name: "context7_get_library_docs",
+		label: "Context7 Get Library Docs",
+		description:
+			"Context7-only 文档获取工具。支持传入精确 libraryId，或用 libraryName 自动解析后获取文档；带本地 TTL 缓存和 docRef。",
+		promptSnippet: "自动解析 Context7 library 并获取文档片段",
+		promptGuidelines: [
+			"Use context7_get_library_docs for a fast Context7-only docs lookup when the user gives a package/product and a specific docs question.",
+			"If an exact Context7 library ID is already known, pass libraryId to skip resolving.",
+			"Use context7_get_cached_doc_raw with returned doc_ref when raw cached JSON is needed.",
+		],
+		parameters: Type.Object({
+			query: Type.String({ description: "具体文档问题或任务" }),
+			libraryName: Type.Optional(Type.String({ description: "包名/产品名；未提供 libraryId 时用于自动解析" })),
+			libraryId: Type.Optional(Type.String({ description: "精确 Context7 library ID，例如 /react/react；提供后跳过解析" })),
+			max_results: Type.Optional(Type.Number({ description: "自动解析时的最大候选数（1-20），默认 8", minimum: 1, maximum: 20 })),
+			max_snippets: Type.Optional(Type.Number({ description: "最大片段数（1-20），默认 8", minimum: 1, maximum: 20 })),
+			raw: Type.Optional(Type.Boolean({ description: "返回原始缓存 JSON（包含 raw/snippets/docRef）" })),
+			force_refresh: Type.Optional(Type.Boolean({ description: "跳过 Context7 本地缓存，强制重新请求" })),
+			max_output_bytes: Type.Optional(Type.Number({ description: "返回内容最大字节数，默认 12000", minimum: 3000, maximum: 51200 })),
+		}),
+
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const config = await configManager.getFullConfig();
+			const attempts: ProviderAttempt[] = [];
+			const endStatus = beginStatus(ctx, "Context7 Library Docs");
+			try {
+				const maxResults = clampNumber(params.max_results, 8, 1, 20);
+				const maxSnippets = clampNumber(params.max_snippets, 8, 1, 20);
+				const forceRefresh = !!params.force_refresh;
+				let libraryId = params.libraryId ? normalizeContext7LibraryId(params.libraryId) : "";
+				let resolveCache: Context7CacheState | undefined;
+				let resolveCachePath: string | undefined;
+				let librariesCount = 0;
+
+				if (!libraryId) {
+					const libraryName = params.libraryName || "";
+					if (!libraryName.trim()) throw new Error("libraryId 或 libraryName 至少提供一个");
+					if (isContext7LibraryId(libraryName)) {
+						libraryId = normalizeContext7LibraryId(libraryName);
+					} else {
+						const resolved = await getContext7LibrariesCached(`${libraryName} ${params.query}`, maxResults, forceRefresh, signal, attempts);
+						resolveCache = resolved.cache;
+						resolveCachePath = resolved.cachePath;
+						librariesCount = resolved.libraries.length;
+						libraryId = resolved.libraries.find((item) => item.id)?.id || "";
+					}
+				}
+				if (!libraryId) throw new Error("Context7 未解析到可用 libraryId");
+
+				const docs = await getContext7DocsCached(libraryId, params.query, forceRefresh, signal, attempts);
+				const entry = docs.entry;
+				const sections = [formatContext7DocsEntry(entry, maxSnippets, !!params.raw)];
+				if (!params.raw) {
+					sections.push(`\nLibrary URL: ${context7LibraryUrl(config.context7BaseUrl, entry.libraryId)}`);
+					sections.push(`Raw cached document available via docRef: \`${entry.docRef}\``);
+				}
+				sections.push(...providerAttemptsMarkdown(attempts));
+
+				const rendered = await truncateToolOutput(sections.join("\n"), "context7-library-docs", {
+					maxBytes: clampNumber(params.max_output_bytes, 12000, 3000, 50 * 1024),
+					extension: params.raw ? "json" : "md",
+				});
+				const { content, ...outputDetails } = rendered;
+				return {
+					content: [{ type: "text", text: content }],
+					details: {
+						library_id: entry.libraryId,
+						doc_ref: entry.docRef,
+						snippets_count: entry.snippets.length,
+						libraries_count: librariesCount,
+						resolve_cache: resolveCache,
+						resolve_cache_path: resolveCachePath,
+						docs_cache: docs.cache,
+						docs_cache_path: docs.cachePath,
+						library_url: context7LibraryUrl(config.context7BaseUrl, entry.libraryId),
+						...capabilityDiagnostics(config, attempts, "docs_search"),
+						...outputDetails,
+					},
+				};
+			} finally {
+				endStatus();
+			}
+		},
+	});
+
+	// =========================================================================
+	// Tool: context7_get_cached_doc_raw — 读取 Context7 本地缓存原文
+	// =========================================================================
+	pi.registerTool({
+		name: "context7_get_cached_doc_raw",
+		label: "Context7 Cached Doc Raw",
+		description:
+			"读取 Context7 本地缓存的完整原始文档 JSON。可用 docRef 精确读取，也可按 query/libraryId 做轻量语义匹配。",
+		promptSnippet: "读取 Context7 cached doc raw JSON",
+		promptGuidelines: [
+			"Use context7_get_cached_doc_raw after context7_query_docs or context7_get_library_docs returns a doc_ref.",
+			"If docRef is unknown, pass query and optional libraryId to find the best cached document.",
+		],
+		parameters: Type.Object({
+			docRef: Type.Optional(Type.String({ description: "context7_query_docs/context7_get_library_docs 返回的 doc_ref" })),
+			query: Type.Optional(Type.String({ description: "没有 docRef 时用于查找缓存的语义查询" })),
+			libraryId: Type.Optional(Type.String({ description: "可选 libraryId，用于缩小缓存查找范围" })),
+			max_output_bytes: Type.Optional(Type.Number({ description: "返回内容最大字节数，默认 12000", minimum: 3000, maximum: 51200 })),
+		}),
+
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const config = await configManager.getFullConfig();
+			const attempts: ProviderAttempt[] = [];
+			const endStatus = beginStatus(ctx, "Context7 Cache Raw");
+			try {
+				let entry: Context7DocsCacheEntry | null = null;
+				let cachePath = "";
+				if (params.docRef) {
+					cachePath = context7DocsCachePath(params.docRef);
+					entry = await readJsonCache<Context7DocsCacheEntry>(cachePath);
+				} else if (params.query) {
+					entry = await findContext7CachedDoc(params.query, params.libraryId);
+					cachePath = entry ? context7DocsCachePath(entry.docRef) : "";
+				} else {
+					throw new Error("docRef 或 query 至少提供一个");
+				}
+				if (!entry) {
+					pushCacheAttempt(attempts, "context7_cache", false, "cache_miss");
+					return {
+						content: [{ type: "text", text: "未找到匹配的 Context7 缓存文档。先调用 context7_query_docs 或 context7_get_library_docs。" }],
+						details: { cache: "miss", cache_path: cachePath, ...capabilityDiagnostics(config, attempts, "docs_search") },
+					};
+				}
+				pushCacheAttempt(attempts, "context7_cache");
+				const rendered = await truncateToolOutput(JSON.stringify(entry, null, 2), "context7-cached-doc", {
+					maxBytes: clampNumber(params.max_output_bytes, 12000, 3000, 50 * 1024),
+					extension: "json",
+				});
+				const { content, ...outputDetails } = rendered;
+				return {
+					content: [{ type: "text", text: content }],
+					details: {
+						cache: "hit",
+						doc_ref: entry.docRef,
+						library_id: entry.libraryId,
+						snippets_count: entry.snippets.length,
+						cache_path: cachePath,
+						...capabilityDiagnostics(config, attempts, "docs_search"),
+						...outputDetails,
+					},
+				};
 			} finally {
 				endStatus();
 			}
@@ -4016,6 +4609,9 @@ export default function (pi: ExtensionAPI) {
 					`| Firecrawl API Key | ${config.firecrawlApiKey ? configManager.maskKey(config.firecrawlApiKey) : "❌ 未配置"} |`,
 					`| Context7 Base URL | ${config.context7BaseUrl} |`,
 					`| Context7 API Key | ${config.context7ApiKey ? configManager.maskKey(config.context7ApiKey) : "可选/未配置"} |`,
+					`| Context7 Resolve TTL | ${config.context7ResolveTtlHours}h |`,
+					`| Context7 Docs TTL | ${config.context7DocsTtlHours}h |`,
+					`| Context7 Cache Dir | ${context7CacheRoot()} |`,
 					`| Exa Base URL | ${config.exaBaseUrl} |`,
 					`| Exa API Key | ${config.exaApiKey ? configManager.maskKey(config.exaApiKey) : "❌ 未配置"} |`,
 					`| 配置文件 | ${configManager.getConfigPath()} |`,
@@ -4202,6 +4798,12 @@ export default function (pi: ExtensionAPI) {
 						break;
 					case "context7BaseUrl":
 						await configManager.setContext7(config.context7ApiKey, params.value);
+						break;
+					case "context7ResolveTtlHours":
+						await configManager.setContext7Cache("context7ResolveTtlHours", Number(params.value));
+						break;
+					case "context7DocsTtlHours":
+						await configManager.setContext7Cache("context7DocsTtlHours", Number(params.value));
 						break;
 					case "exaApiKey":
 						await configManager.setExa(params.value);
@@ -4587,13 +5189,14 @@ export default function (pi: ExtensionAPI) {
 	// Command: /search-config
 	// =========================================================================
 	pi.registerCommand("search-config", {
-		description: "配置 Pi Search（Search API / Tavily / Firecrawl API）",
+		description: "配置 Pi Search（Search API / Context7 / Exa / Tavily / Firecrawl）",
 		handler: async (_args, ctx) => {
 			const config = await configManager.getFullConfig();
 			const choice = await ctx.ui.select("Pi Search 配置:", [
 				"查看当前配置",
 				"设置 Search API",
 				"设置 Context7 API",
+				"设置 Context7 Cache TTL",
 				"设置 Exa API",
 				"设置 Tavily API",
 				"设置 Firecrawl API",
@@ -4646,6 +5249,7 @@ export default function (pi: ExtensionAPI) {
 						`Fallback Mode: ${config.fallbackMode}`,
 						`Minimum Profile: ${config.minimumProfile}`,
 						`Context7: ${config.context7BaseUrl} | ${config.context7ApiKey ? configManager.maskKey(config.context7ApiKey) : "API Key 可选/未配置"}`,
+						`Context7 Cache: resolve ${config.context7ResolveTtlHours}h / docs ${config.context7DocsTtlHours}h | ${context7CacheRoot()}`,
 						`Exa: ${config.exaApiKey ? configManager.maskKey(config.exaApiKey) : "未配置"}`,
 						`Tavily: ${config.tavilyApiKey ? configManager.maskKey(config.tavilyApiKey) : "未配置"}`,
 						`Firecrawl: ${config.firecrawlApiKey ? configManager.maskKey(config.firecrawlApiKey) : "未配置"}`,
@@ -4673,6 +5277,18 @@ export default function (pi: ExtensionAPI) {
 					const key = await ctx.ui.input("Context7 API Key（可留空）:", "");
 					await configManager.setContext7(key || "", url);
 					ctx.ui.notify(`✅ Context7 已配置`, "info");
+					break;
+				}
+
+				case "设置 Context7 Cache TTL": {
+					const resolveTtl = await ctx.ui.input("Context7 resolve cache TTL hours:", String(config.context7ResolveTtlHours));
+					if (!resolveTtl) return;
+					const docsTtl = await ctx.ui.input("Context7 docs cache TTL hours:", String(config.context7DocsTtlHours));
+					if (!docsTtl) return;
+					await configManager.setContext7Cache("context7ResolveTtlHours", Number(resolveTtl));
+					await configManager.setContext7Cache("context7DocsTtlHours", Number(docsTtl));
+					const updated = await configManager.getFullConfig();
+					ctx.ui.notify(`✅ Context7 Cache TTL 已配置: resolve ${updated.context7ResolveTtlHours}h / docs ${updated.context7DocsTtlHours}h`, "info");
 					break;
 				}
 
