@@ -10,16 +10,19 @@ Complete web access for [pi](https://github.com/earendil-works/pi-mono) powered 
 
 ```
 pi ──Extension──► pi-search
-                    ├─ search          ───► Search API (AI Deep Search)
-                    ├─ search_sources  ───► Source Cache (by session_id)
-                    ├─ web_fetch       ───► Tavily Extract → Firecrawl Scrape → Direct Fetch (auto-fallback)
-                    ├─ web_map         ───► Tavily Map (Site Mapping)
-                    └─ search_planning ───► 6-Phase Structured Search Planning
+                    ├─ search_tools    ───► Activate additional capabilities on demand
+                    ├─ search          ───► Search API + docs source enrichment
+                    ├─ docs_search     ───► Context7 + Exa authoritative discovery
+                    ├─ web_fetch       ───► Tavily → Firecrawl → smart_direct → direct evidence fetch
+                    └─ deferred tools  ───► context7_* / search_sources / web_map / planning / diagnostics
 ```
 
 ## Features
 
 - **🔍 AI Deep Search** — Search-model-powered, auto time injection, platform focus, compact output by default
+- **🧰 Deferred tool loading** — Keeps `search_tools`, `search`, `docs_search`, and `web_fetch` active by default, then incrementally activates specialized tools
+- **🧾 Evidence boundaries** — Search results are marked as discovery candidates; claim-level conclusions should fetch selected pages first
+- **🧭 Observable routing** — Returns `routing_decision`, `provider_attempts`, `providers_used`, `fallback_used`, and capability status
 - **🎛️ Search profiles** — Switch Auto / Coding Docs / Code Examples / Project Research / Academic / Fact Check in `/search-config`
 - **📄 Web Fetch** — Tavily Extract → Firecrawl Scrape → Direct Fetch auto-fallback, supports `markdown/text/html/json/raw` plus lightweight metadata, preview output by default
 - **🗺️ Site Mapping** — Tavily Map traverses website structure with conservative defaults
@@ -114,16 +117,14 @@ Persisted to `~/.config/pi-search/config.json`:
 
 ### Tools (Auto-invoked by LLM)
 
-| Tool | Description |
-| ---- | ----------- |
-| `search` | AI search with compact default output + session_id |
-| `search_sources` | Retrieve paginated source list by session_id |
-| `web_fetch` | Fetch web content preview (Tavily → Firecrawl → direct fallback, multi-format) |
-| `web_map` | Traverse website structure with bounded output |
-| `search_config` | View / modify / test configuration |
-| `search_planning` | 6-phase structured search planning |
+| Default active tool | Description |
+| ------------------- | ----------- |
+| `search_tools` | Incrementally activate `context7`, `sources`, `site_map`, `planning`, or `diagnostics` groups |
+| `search` | Bounded AI search with routing metadata, discovery evidence, and session_id |
+| `docs_search` | Context7 + Exa documentation, API, GitHub, and authoritative-source discovery |
+| `web_fetch` | Fetch page-content evidence through Tavily → Firecrawl → smart_direct → direct |
 
-After installation, LLM automatically recognizes these tools and decides when to call them.
+Specialized Context7 tools, `search_sources`, `web_map`, `search_planning`, and read-only `search_config` are deferred. Legacy `plan_*` tools are disabled by default and can be restored with `PI_SEARCH_ENABLE_LEGACY_PLANNING_TOOLS=1`.
 
 ### `web_fetch` vs pi-smart-fetch
 

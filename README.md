@@ -10,20 +10,20 @@
 
 ```
 pi ──Extension──► pi-search
+                    ├─ search_tools    ───► 按需激活额外搜索能力
                     ├─ search          ───► Search API（AI 深度搜索）+ docs source enrichment
-                    ├─ context7_*      ───► Context7 官方 MCP 风格快速文档查找
                     ├─ docs_search     ───► Context7 + Exa（官方文档/API/GitHub 高可信来源）
-                    ├─ search_sources  ───► 信源缓存（按 session_id）
-                    ├─ web_fetch       ───► Tavily Extract → Firecrawl Scrape → smart_direct → Direct Fetch（同能力降级）
-                    ├─ web_map         ───► Tavily Map（站点映射）
-                    └─ search_planning ───► 6 阶段结构化搜索规划 + offline research_plan
+                    ├─ web_fetch       ───► Tavily Extract → Firecrawl Scrape → smart_direct → Direct Fetch（证据正文）
+                    └─ deferred tools  ───► context7_* / search_sources / web_map / search_planning / search_config
 ```
 
 ## 功能特性
 
 - **🔍 AI 深度搜索** — 搜索模型驱动，自动时间注入，支持平台聚焦，默认紧凑输出
+- **🧰 动态工具加载** — 默认只保留 `search_tools`、`search`、`docs_search`、`web_fetch`，按需增量激活 Context7 细分工具、信源分页、站点映射、规划和诊断
 - **📚 文档/API 检索** — `context7_resolve_library_id` / `context7_query_docs` 提供官方 MCP 风格快速查文档，`context7_get_library_docs` 支持自动解析 + TTL 缓存 + raw docRef；`docs_search` 通过 Context7 + Exa 做聚合检索
-- **🧭 Capability / Provider 诊断** — 返回 `provider_attempts`、`fallback_used`、`capability_status`、`minimum_profile`，避免黑盒降级
+- **🧭 Capability / Provider 诊断** — 返回 `routing_decision`、`provider_attempts`、`providers_used`、`fallback_used`、`capability_status`、`minimum_profile`，避免黑盒降级
+- **🧾 证据边界** — 搜索结果标记为 discovery candidates；高风险或 claim-level 结论要求先 `web_fetch`，抓取结果标记为 fetched page content
 - **🎛️ 搜索模式预设** — `/search-config` 中切换 Auto / 编程文档 / 代码示例 / 项目调研 / 论文资料 / 事实核查
 - **📄 网页抓取** — Tavily Extract → Firecrawl Scrape → `smart_direct` → Direct Fetch 同能力降级，支持 `markdown/text/html/json/raw` 与轻量 metadata，长输出自动折叠保存
 - **🗺️ 站点映射** — Tavily Map 遍历网站结构，默认限制链接与输出大小
@@ -90,8 +90,10 @@ export TAVILY_API_KEY="tvly-your-key"
 export FIRECRAWL_API_KEY="fc-your-key"
 
 # 运行策略（可选）
-export SEARCH_FALLBACK_MODE="auto"      # auto | off
+export SEARCH_FALLBACK_MODE="auto"       # auto | off
 export SEARCH_MINIMUM_PROFILE="standard" # standard | off
+export PI_SEARCH_DEFERRED_TOOLS="1"       # 默认 1；设为 0 可关闭动态工具收敛
+export PI_SEARCH_ENABLE_LEGACY_PLANNING_TOOLS="0" # 默认 0；设为 1 恢复旧 plan_* 工具
 ```
 
 ### 交互式配置
@@ -140,21 +142,22 @@ export SEARCH_MINIMUM_PROFILE="standard" # standard | off
 
 ### 工具（LLM 自动调用）
 
-| 工具 | 说明 |
-| ---- | ---- |
-| `search` | AI 深度搜索，默认 compact 输出；docs/profile 场景会自动补充 Context7/Exa 信源；返回结果 + session_id |
-| `context7_resolve_library_id` | Context7 官方 MCP 风格：包名/产品名解析为 library ID |
-| `context7_query_docs` | Context7 官方 MCP 风格：用 library ID 查询文档和代码片段，返回 `doc_ref` |
-| `context7_get_library_docs` | Context7 专用：libraryName 自动解析或 libraryId 直查，带 TTL 缓存和 `doc_ref` |
-| `context7_get_cached_doc_raw` | 读取 Context7 本地缓存原始 JSON，可用 `docRef` 或 query/libraryId 语义查找 |
+| 默认激活工具 | 说明 |
+| ------------ | ---- |
+| `search_tools` | 按需激活 `context7`、`sources`、`site_map`、`planning`、`diagnostics` 工具组 |
+| `search` | AI 搜索，默认 compact 输出；返回 discovery 结果、路由信息、信源边界和 session_id |
 | `docs_search` | Context7 + Exa 文档/API/GitHub 高可信来源聚合检索 |
-| `search_sources` | 通过 session_id 分页获取信源列表 |
-| `web_fetch` | 抓取网页内容预览（Tavily → Firecrawl → smart_direct → direct 同能力降级，多格式，长输出自动折叠） |
-| `web_map` | 遍历网站结构，生成受限站点地图 |
-| `search_config` | 查看/修改/测试配置，返回 capability/provider 诊断 |
-| `search_planning` | 6 阶段结构化搜索规划，完成时输出 `research_plan` |
+| `web_fetch` | 抓取明确 URL 的正文证据（Tavily → Firecrawl → smart_direct → direct） |
 
-安装后 LLM 会自动识别这些工具，根据用户问题自主决定调用。
+| 按需激活工具 | 激活方式 |
+| ------------ | -------- |
+| `context7_resolve_library_id` / `context7_query_docs` / `context7_get_library_docs` / `context7_get_cached_doc_raw` | `search_tools({ capabilities: ["context7"] })` |
+| `search_sources` | 搜索产生缓存后自动激活，或激活 `sources` |
+| `web_map` | 激活 `site_map` |
+| `search_planning` | 激活 `planning`；一次调用生成离线 `research_plan` |
+| `search_config` | 激活 `diagnostics`；仅只读查看或显式测试连接，写配置必须使用 `/search-config` |
+
+旧的 `plan_*` 多轮规划工具默认不注册；仅兼容旧工作流时设置 `PI_SEARCH_ENABLE_LEGACY_PLANNING_TOOLS=1`。
 
 ### Capability / Provider 诊断
 
@@ -317,15 +320,17 @@ Context7 缓存行为：
 
 ### Offline research_plan
 
-`search_planning` 和 `plan_*` 工具完成所需阶段后，除原有 `executable_plan` 外，还返回 smartsearch 风格的 offline `research_plan`：
+`search_planning` 一次调用生成 smart-search 风格的 offline `research_plan`：
 
-- `intent_signals`：时效性、docs/API 意图、已知 URL、claim risk、是否需要交叉验证
-- `capability_plan`：计划使用的 `main_search/docs_search/web_fetch/site_map` 等能力
-- `steps`：每个 sub-query 的建议工具、capability、query 和 params
+- `intent_signals`：时效性、docs/API 意图、已知 URL、claim risk、来源权威性和交叉验证要求
+- `capability_plan`：每种能力对应的工具和选择理由
+- `preflight`：配置不确定时先激活 `diagnostics` 并调用 `search_config action=show`
+- `steps`：稳定步骤 ID、subquestion、工具、capability、query、params 和 evidence requirement
 - `evidence_policy: "fetch_before_claim"`
-- `gap_check`：缺失 tool mapping 等规划缺口
+- `gap_check`：强制检查关键结论是否已有抓取正文支持
+- `final_answer_policy`：区分已抓取证据和未验证 discovery candidates
 
-该计划默认只离线规划，不自动调用 provider、不抓取页面、不验证结论。
+该计划只离线规划，不调用 provider、不抓取页面、不验证结论；生成后会增量激活计划实际需要的工具。
 
 ## 信源质量准则
 

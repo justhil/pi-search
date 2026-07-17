@@ -397,28 +397,53 @@ function buildResearchPlan(session: PlanningSession): Record<string, unknown> {
 	const tools = toolMappings.length > 0
 		? toolMappings.map((mapping) => String(mapping.tool || "search"))
 		: decomposition.map((item) => String(item.tool_hint || "search"));
+	const capabilities = [...new Set(tools.map((tool) => capabilityForTool(tool)))];
+	const claimRisk = String(intent.claim_risk || inferClaimRisk(intent, complexity));
+	const crossValidationNeed = String(
+		intent.cross_validation_need ||
+		(session.complexityLevel === 3 || String(intent.query_type) === "fact_check" ? "high" : "normal"),
+	);
 
 	return {
 		mode: "deep_research",
 		query_mode: "deep",
+		question: String(intent.core_question || decomposition[0]?.goal || ""),
+		trigger_source: "explicit_tool",
+		difficulty: session.complexityLevel === 3 ? "high" : "standard",
 		session_id: session.sessionId,
 		intent_signals: {
-			recency: ["realtime", "recent"].includes(String(intent.time_sensitivity || "")),
+			recency_requirement: normalizeResearchRecency(intent.recency_requirement || intent.time_sensitivity),
 			docs_api_intent: inferDocsIntent(intent, decomposition),
+			locale_domain_scope: String(intent.locale_domain_scope || "global"),
 			known_url: hasKnownUrl(intent, decomposition, strategy),
-			claim_risk: inferClaimRisk(intent, complexity),
-			source_authority_required: true,
-			cross_validation_required: session.complexityLevel === 3 || String(intent.query_type) === "fact_check",
+			source_authority_need: String(intent.source_authority_need || "high"),
+			claim_risk: claimRisk,
+			cross_validation_need: crossValidationNeed,
+			breadth_depth_budget: String(complexity.budget || (session.complexityLevel === 3 ? "deep" : "standard")),
 		},
 		decomposition,
-		capability_plan: [...new Set(tools.map((tool) => capabilityForTool(tool)))].map((capability) => ({
+		capability_plan: capabilities.map((capability) => ({
 			capability,
-			purpose: capabilityPurpose(capability),
+			tools: tools.filter((tool) => capabilityForTool(tool) === capability),
+			reason: capabilityPurpose(capability),
 		})),
+		preflight: {
+			tool: "search_config",
+			action: "show",
+			when: "Provider configuration or capability availability is uncertain",
+		},
 		steps: buildResearchSteps(decomposition, strategy, toolMappings, execution),
 		evidence_policy: "fetch_before_claim",
-		gap_check: buildGapCheck(decomposition, toolMappings),
-		usage_boundary: "Offline plan only: this does not call providers, fetch pages, or verify claims automatically.",
+		gap_check: {
+			required: true,
+			gaps: buildGapCheck(decomposition, toolMappings),
+			rule: "Fetch key pages before claim-level conclusions; otherwise mark the source or claim as unverified.",
+		},
+		final_answer_policy: "Cite fetched evidence, separate discovery candidates from verified evidence, and disclose unresolved gaps.",
+		usage_boundary: {
+			planning: "Offline plan only: this does not call providers, fetch pages, or verify claims automatically.",
+			execution: "Execute the listed Pi Search tools, then run the required gap check before answering.",
+		},
 	};
 }
 
@@ -428,6 +453,13 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 function asArray(value: unknown): unknown[] {
 	return Array.isArray(value) ? value : value === undefined ? [] : [value];
+}
+
+function normalizeResearchRecency(value: unknown): "none" | "recent" | "current" {
+	const normalized = String(value || "none").toLowerCase();
+	if (normalized === "current" || normalized === "realtime") return "current";
+	if (normalized === "recent") return "recent";
+	return "none";
 }
 
 function inferDocsIntent(intent: Record<string, unknown>, decomposition: Record<string, unknown>[]): boolean {
@@ -464,21 +496,43 @@ function buildResearchSteps(
 ): Array<Record<string, unknown>> {
 	const terms = asArray(strategy.search_terms).filter(isRecord);
 	const mappings = new Map(toolMappings.map((mapping) => [String(mapping.sub_query_id || ""), mapping]));
-	const steps = decomposition.map((item) => {
-		const id = String(item.id || "");
+	const steps = decomposition.map((item, index) => {
+		const id = String(item.id || `sq${index + 1}`);
 		const mapping = mappings.get(id);
 		const term = terms.find((candidate) => String(candidate.purpose || "") === id);
 		const tool = String(mapping?.tool || item.tool_hint || "search");
+		const query = String(term?.term || item.query || item.goal || "");
+		const mappedParams = asRecord(mapping?.params || mapping?.params_raw);
+		const params = Object.keys(mappedParams).length > 0
+			? mappedParams
+			: tool === "web_fetch" || tool === "web_map"
+				? { url: query }
+				: { query };
 		return {
+			id: `s${index + 1}`,
 			subquestion_id: id,
 			tool,
 			capability: capabilityForTool(tool),
-			purpose: mapping?.reason || item.goal || "Gather evidence",
-			query: term?.term || item.goal,
-			params: mapping?.params || mapping?.params_raw || {},
+			purpose: mapping?.reason || item.reason || item.goal || "Gather evidence",
+			query,
+			params,
+			evidence_requirement: tool === "web_fetch"
+				? "Fetched page content suitable for claim-level evidence"
+				: "Discovery output; fetch selected source pages before high-risk conclusions",
 		};
 	});
-	return steps.length > 0 ? steps : [{ tool: "search", capability: "main_search", purpose: "Gather initial evidence" }];
+	return steps.length > 0
+		? steps
+		: [{
+			id: "s1",
+			subquestion_id: "sq1",
+			tool: "search",
+			capability: "main_search",
+			purpose: "Gather initial evidence",
+			query: "",
+			params: { query: "" },
+			evidence_requirement: "Discovery output; fetch selected source pages before high-risk conclusions",
+		}];
 }
 
 function buildGapCheck(
@@ -1106,12 +1160,35 @@ function capabilityDiagnostics(
 	const statuses = capabilityStatus(config);
 	return {
 		provider_attempts: attempts,
+		providers_used: [...new Set(attempts.filter((attempt) => attempt.ok).map((attempt) => attempt.provider))],
 		fallback_used: fallbackUsed(attempts, capability),
 		capability_status: statuses,
 		minimum_profile: {
 			profile: config.minimumProfile,
 			satisfied: minimumProfileSatisfied(statuses, config.minimumProfile),
 		},
+	};
+}
+
+function safeConfigDetails(config: RuntimeConfig): Record<string, unknown> {
+	return {
+		searchApiUrl: config.searchApiUrl,
+		searchApiConfigured: Boolean(config.searchApiUrl && config.searchApiKey),
+		searchModel: config.searchModel,
+		searchProfile: config.searchProfile,
+		fallbackMode: config.fallbackMode,
+		minimumProfile: config.minimumProfile,
+		context7BaseUrl: config.context7BaseUrl,
+		context7Configured: Boolean(config.context7BaseUrl),
+		context7Authenticated: Boolean(config.context7ApiKey),
+		context7ResolveTtlHours: config.context7ResolveTtlHours,
+		context7DocsTtlHours: config.context7DocsTtlHours,
+		exaBaseUrl: config.exaBaseUrl,
+		exaConfigured: Boolean(config.exaApiKey),
+		tavilyApiUrl: config.tavilyApiUrl,
+		tavilyConfigured: Boolean(config.tavilyApiKey),
+		firecrawlApiUrl: config.firecrawlApiUrl,
+		firecrawlConfigured: Boolean(config.firecrawlApiKey),
 	};
 }
 
@@ -3602,6 +3679,8 @@ function webFetchDetails(result: WebFetchResult, outputDetails: Record<string, u
 		provider: result.provider,
 		format: result.format,
 		metadata: result.metadata,
+		evidence_level: "fetched_page_content",
+		evidence_warning: "Verify that the fetched text directly supports each claim and disclose truncation, extraction, or access limitations.",
 		...outputDetails,
 	};
 }
@@ -3635,28 +3714,61 @@ function fetchFailure(
 // =============================================================================
 
 const searchConfigParameters = Type.Object({
-	action: StringEnum(["show", "set", "test"] as const),
-	key: Type.Optional(
-		StringEnum([
-			"searchApiUrl",
-			"searchApiKey",
-			"model",
-			"searchProfile",
-			"fallbackMode",
-			"minimumProfile",
-			"tavilyApiKey",
-			"tavilyApiUrl",
-			"firecrawlApiKey",
-			"firecrawlApiUrl",
-			"context7ApiKey",
-			"context7BaseUrl",
-			"context7ResolveTtlHours",
-			"context7DocsTtlHours",
-			"exaApiKey",
-			"exaBaseUrl",
-		] as const),
-	),
-	value: Type.Optional(Type.String()),
+	action: StringEnum(["show", "test"] as const, {
+		description: "show returns masked capability status; test performs explicit provider connectivity checks",
+	}),
+}, { additionalProperties: false });
+
+const searchPlanningParameters = Type.Object({
+	question: Type.String({ description: "The research question to plan without calling providers" }),
+	budget: Type.Optional(StringEnum(["quick", "standard", "deep"] as const)),
+	recency_requirement: Type.Optional(StringEnum(["none", "recent", "current"] as const)),
+	locale_domain_scope: Type.Optional(StringEnum(["global", "china", "known_domains", "mixed"] as const)),
+	source_authority_need: Type.Optional(StringEnum(["normal", "high"] as const)),
+	claim_risk: Type.Optional(StringEnum(["low", "medium", "high"] as const)),
+	cross_validation_need: Type.Optional(StringEnum(["normal", "high"] as const)),
+	known_urls: Type.Optional(Type.Array(Type.String({ description: "Known source URL" }), { maxItems: 10 })),
+	sub_queries: Type.Optional(Type.Array(Type.Object({
+		id: Type.String({ description: "Stable sub-question ID such as sq1" }),
+		question: Type.String({ description: "Focused sub-question" }),
+		reason: Type.String({ description: "Why this sub-question is needed" }),
+		tool: Type.Optional(StringEnum(["search", "docs_search", "web_fetch", "web_map"] as const)),
+		query: Type.Optional(Type.String({ description: "Tool query or URL; defaults to the sub-question" })),
+	}), { minItems: 1, maxItems: 6 })),
+});
+
+const SEARCH_TOOL_GROUP_VALUES = ["context7", "sources", "site_map", "planning", "diagnostics"] as const;
+type SearchToolGroup = (typeof SEARCH_TOOL_GROUP_VALUES)[number];
+
+const SEARCH_TOOL_GROUPS: Record<SearchToolGroup, readonly string[]> = {
+	context7: [
+		"context7_resolve_library_id",
+		"context7_query_docs",
+		"context7_get_library_docs",
+		"context7_get_cached_doc_raw",
+	],
+	sources: ["search_sources"],
+	site_map: ["web_map"],
+	planning: ["search_planning"],
+	diagnostics: ["search_config"],
+};
+
+const SEARCH_TOOL_GROUP_DESCRIPTIONS: Record<SearchToolGroup, string> = {
+	context7: "Granular Context7 library resolution, documentation lookup, and raw cache access",
+	sources: "Paginated access to source URLs cached by search and docs_search",
+	site_map: "Bounded website structure discovery through Tavily Map",
+	planning: "One-shot offline deep-research planning with fetch-before-claim policy",
+	diagnostics: "Read-only capability status and explicit provider connectivity diagnostics",
+};
+
+const DEFERRED_SEARCH_TOOLS = new Set(Object.values(SEARCH_TOOL_GROUPS).flat());
+
+const searchToolsParameters = Type.Object({
+	capabilities: Type.Array(StringEnum(SEARCH_TOOL_GROUP_VALUES), {
+		description: "Additional capability groups to activate for this session",
+		minItems: 1,
+		maxItems: SEARCH_TOOL_GROUP_VALUES.length,
+	}),
 });
 
 const SEARCH_PROMPT_BASE = `# Core Instruction
@@ -3701,16 +3813,69 @@ function buildSearchPrompt(profile: SearchProfile, controls: SearchControls): st
 // =============================================================================
 
 export default function (pi: ExtensionAPI) {
-	// =========================================================================
-	// Tool: search — AI 网络搜索
-	// =========================================================================
+	const deferredToolLoadingEnabled = process.env.PI_SEARCH_DEFERRED_TOOLS !== "0";
+	const activateSearchTools = (toolNames: readonly string[]): string[] => {
+		const activeTools = pi.getActiveTools();
+		const activeToolSet = new Set(activeTools);
+		const addedTools = toolNames.filter((toolName) => !activeToolSet.has(toolName));
+		if (addedTools.length > 0) pi.setActiveTools([...activeTools, ...addedTools]);
+		return addedTools;
+	};
+
+	pi.on("session_start", () => {
+		if (!deferredToolLoadingEnabled) return;
+		const initialTools = pi.getActiveTools().filter((toolName) => !DEFERRED_SEARCH_TOOLS.has(toolName));
+		pi.setActiveTools(initialTools);
+	});
+
 	pi.on("before_agent_start", async (_event, _ctx) => {
 		const config = await configManager.getFullConfig();
 		return {
-			systemPrompt: `${_event.systemPrompt}\n\n${SEARCH_PROFILE_DEFS[config.searchProfile].lightPrompt}\n${WEB_FETCH_LIGHT_PROMPT}`,
+			systemPrompt: `${_event.systemPrompt}\n\n${SEARCH_PROFILE_DEFS[config.searchProfile].lightPrompt}\n${WEB_FETCH_LIGHT_PROMPT}\nAdditional Pi Search capabilities are deferred. Use search_tools only when granular Context7 access, cached source paging, site mapping, deep-research planning, or diagnostics are actually needed.`,
 		};
 	});
 
+	// =========================================================================
+	// Tool: search_tools — incremental capability loader
+	// =========================================================================
+	pi.registerTool<typeof searchToolsParameters, Record<string, unknown>>({
+		name: "search_tools",
+		label: "Search Tools",
+		description:
+			"按需激活额外 Pi Search 工具组，减少普通轮次的工具定义和选择噪音。" +
+			"基础 search、docs_search、web_fetch 始终可用；仅在确有需要时激活 Context7 细分工具、缓存信源分页、站点映射、离线规划或诊断。",
+		promptSnippet: "按需激活额外搜索能力，避免默认暴露全部工具",
+		promptGuidelines: [
+			"Use search_tools only when the active search, docs_search, and web_fetch tools cannot complete the task.",
+			"Activate planning only for explicit deep research, multi-source verification, or complex comparison requests.",
+			"Activate diagnostics only when the user asks about provider configuration or connectivity.",
+			"Tool activation is incremental for the current session; do not activate every group preemptively.",
+		],
+		parameters: searchToolsParameters,
+		async execute(_toolCallId, params) {
+			const requestedGroups = [...new Set(params.capabilities)];
+			const requestedTools = requestedGroups.flatMap((group) => SEARCH_TOOL_GROUPS[group]);
+			const addedTools = activateSearchTools(requestedTools);
+			const result = {
+				requested_groups: requestedGroups,
+				groups: requestedGroups.map((group) => ({
+					group,
+					description: SEARCH_TOOL_GROUP_DESCRIPTIONS[group],
+					tools: SEARCH_TOOL_GROUPS[group],
+				})),
+				added_tools: addedTools,
+				active_tools: pi.getActiveTools(),
+			};
+			return {
+				content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+				details: result,
+			};
+		},
+	});
+
+	// =========================================================================
+	// Tool: search — AI 网络搜索
+	// =========================================================================
 	pi.registerTool({
 		name: "search",
 		label: "Pi Search",
@@ -3874,15 +4039,12 @@ export default function (pi: ExtensionAPI) {
 				// Parse Search Model response
 				const { answer, sources: primarySources } =
 					splitAnswerAndSources(primaryResult);
-				const allSources = mergeSources(
-					primarySources,
-					docsSources,
-					tavilySources,
-					firecrawlSources,
-				);
+				const extraSources = mergeSources(docsSources, tavilySources, firecrawlSources);
+				const allSources = mergeSources(primarySources, extraSources);
 
-				// Cache sources
+				// Cache sources and expose paging only after a session actually has sources.
 				sourcesCache.set(sessionId, allSources);
+				if (allSources.length > 0) activateSearchTools(["search_sources"]);
 
 				// Build output
 				const limitedAnswer = limitText(answer, controls.maxAnswerChars);
@@ -3920,6 +4082,15 @@ export default function (pi: ExtensionAPI) {
 						mode: controls.mode,
 						model: effectiveModel,
 						docs_search_enriched: docsSources.length > 0,
+						routing_decision: {
+							main_search: "openai_compatible",
+							docs_enrichment: docsSearchEnabled,
+							extra_source_budget: extraBudget,
+						},
+						primary_sources: limitSources(primarySources, controls.maxSources),
+						extra_sources: limitSources(extraSources, controls.maxSources),
+						evidence_level: "discovery",
+						source_warning: "Search and enrichment sources are discovery candidates. Fetch key pages with web_fetch before high-risk or claim-level conclusions.",
 						...capabilityDiagnostics(config, attempts),
 						...outputDetails,
 					},
@@ -4275,6 +4446,7 @@ export default function (pi: ExtensionAPI) {
 					signal,
 				);
 				sourcesCache.set(sessionId, result.sources);
+				if (result.sources.length > 0) activateSearchTools(["search_sources"]);
 				let output = result.output;
 				if (result.sources.length > 0) {
 					const visibleSources = limitSources(result.sources, clampNumber(params.max_results, 6, 1, 20));
@@ -4293,6 +4465,9 @@ export default function (pi: ExtensionAPI) {
 					details: {
 						session_id: sessionId,
 						sources_count: result.sources.length,
+						primary_sources: limitSources(result.sources, clampNumber(params.max_results, 6, 1, 20)),
+						evidence_level: "discovery",
+						source_warning: "Documentation search results are discovery evidence. Fetch exact release notes, API pages, or source files when a claim depends on their contents.",
 						...capabilityDiagnostics(config, result.attempts, "docs_search"),
 						...outputDetails,
 					},
@@ -4640,8 +4815,13 @@ export default function (pi: ExtensionAPI) {
 		name: "search_config",
 		label: "Search Config",
 		description:
-			"查看或修改 Pi Search 的完整配置（OpenAI-compatible Search API/Tavily/Firecrawl API）。",
-		promptSnippet: "查看或修改 Pi Search 配置",
+			"只读查看 Pi Search 的掩码配置与能力状态，或在用户明确要求时测试 provider 连接。配置修改必须使用 /search-config。",
+		promptSnippet: "只读查看 Pi Search 能力状态或执行显式连接诊断",
+		promptGuidelines: [
+			"Do not call search_config for normal searches.",
+			"Use action=test only when the user explicitly requests connectivity diagnostics.",
+			"Never pass API keys through this tool; configuration writes require /search-config.",
+		],
 		parameters: searchConfigParameters,
 
 		async execute(_toolCallId, params) {
@@ -4678,7 +4858,10 @@ export default function (pi: ExtensionAPI) {
 
 				return {
 					content: [{ type: "text", text: lines.join("\n") }],
-					details: { ...config },
+					details: {
+						...safeConfigDetails(config),
+						...capabilityDiagnostics(config, []),
+					},
 				};
 			}
 
@@ -4782,154 +4965,136 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			if (params.action === "set") {
-				if (!params.key || !params.value) {
-					throw new Error("action=set 时 key 和 value 为必填项");
-				}
-
-				const displayValue = params.key.toLowerCase().includes("key")
-					? configManager.maskKey(params.value)
-					: params.value;
-
-				switch (params.key) {
-					case "searchApiUrl": {
-						const file = await configManager.loadFile();
-						await configManager.setSearchApi(
-							params.value,
-							file.apiKey || config.searchApiKey,
-						);
-						break;
-					}
-					case "searchApiKey": {
-						const file = await configManager.loadFile();
-						await configManager.setSearchApi(
-							file.apiUrl || config.searchApiUrl,
-							params.value,
-						);
-						break;
-					}
-					case "model":
-						await configManager.setModel(params.value);
-						break;
-					case "searchProfile": {
-						const profile = parseSearchProfile(params.value);
-						if (!profile) {
-							throw new Error(`无效搜索模式: ${params.value}`);
-						}
-						await configManager.setSearchProfile(profile);
-						break;
-					}
-					case "fallbackMode": {
-						if (!(["auto", "off"] as const).includes(params.value as FallbackMode)) {
-							throw new Error("fallbackMode 只能是 auto 或 off");
-						}
-						await configManager.setSearchRuntime("fallbackMode", params.value);
-						break;
-					}
-					case "minimumProfile": {
-						if (!(["standard", "off"] as const).includes(params.value as MinimumProfile)) {
-							throw new Error("minimumProfile 只能是 standard 或 off");
-						}
-						await configManager.setSearchRuntime("minimumProfile", params.value);
-						break;
-					}
-					case "tavilyApiKey":
-						await configManager.setTavily(params.value);
-						break;
-					case "tavilyApiUrl":
-						await configManager.setTavily(config.tavilyApiKey, params.value);
-						break;
-					case "firecrawlApiKey":
-						await configManager.setFirecrawl(params.value);
-						break;
-					case "firecrawlApiUrl":
-						await configManager.setFirecrawl(
-							config.firecrawlApiKey,
-							params.value,
-						);
-						break;
-					case "context7ApiKey":
-						await configManager.setContext7(params.value);
-						break;
-					case "context7BaseUrl":
-						await configManager.setContext7(config.context7ApiKey, params.value);
-						break;
-					case "context7ResolveTtlHours":
-						await configManager.setContext7Cache("context7ResolveTtlHours", Number(params.value));
-						break;
-					case "context7DocsTtlHours":
-						await configManager.setContext7Cache("context7DocsTtlHours", Number(params.value));
-						break;
-					case "exaApiKey":
-						await configManager.setExa(params.value);
-						break;
-					case "exaBaseUrl":
-						await configManager.setExa(config.exaApiKey, params.value);
-						break;
-				}
-
-				return {
-					content: [
-						{ type: "text", text: `✅ 已更新 ${params.key} = ${displayValue}` },
-					],
-					details: { key: params.key, updated: true },
-				};
-			}
-
 			throw new Error(`未知 action: ${params.action}`);
 		},
 	});
 
 	// =========================================================================
-	// Tool: search_planning — 搜索规划（6 阶段）
+	// Tool: search_planning — one-shot offline research planner
 	// =========================================================================
-	pi.registerTool({
+	pi.registerTool<typeof searchPlanningParameters, Record<string, unknown>>({
 		name: "search_planning",
 		label: "Search Planning",
 		description:
-			"结构化搜索规划工具。在执行复杂搜索前先生成可执行的搜索计划。\n" +
-			"流程: plan_intent → plan_complexity → plan_sub_query(×N) → plan_search_term(×N) → plan_tool_mapping(×N) → plan_execution\n" +
-			"复杂度 Level 1 = 阶段 1-3; Level 2 = 阶段 1-5; Level 3 = 全部 6 阶段。",
-		promptSnippet: "结构化搜索规划（分阶段、多轮）",
+			"一次调用生成离线 research_plan，不执行搜索、不抓取网页。仅用于显式深度调研、多源核验或复杂比较任务。",
+		promptSnippet: "为复杂调研生成一次性的离线证据计划",
 		promptGuidelines: [
-			"Use search_planning before executing complex, multi-faceted searches to create a structured plan.",
+			"Use search_planning only for explicit deep research, multi-source verification, or complex comparison requests.",
+			"Do not call it for ordinary lookups; call search or docs_search directly.",
+			"After planning, execute only the listed tools and fetch key pages before claim-level conclusions.",
 		],
-		parameters: Type.Object({
-			phase: StringEnum([
-				"intent_analysis",
-				"complexity_assessment",
-				"query_decomposition",
-				"search_strategy",
-				"tool_selection",
-				"execution_order",
-			] as const),
-			thought: Type.String({ description: "本阶段的推理过程" }),
-			session_id: Type.Optional(
-				Type.String({ description: "留空创建新会话，或传入已有 ID" }),
-			),
-			is_revision: Type.Optional(
-				Type.Boolean({ description: "是否覆盖已有阶段" }),
-			),
-			confidence: Type.Optional(Type.Number({ description: "置信度 0.0-1.0" })),
-			phase_data: Type.String({ description: "阶段数据，JSON 字符串格式" }),
-		}),
+		parameters: searchPlanningParameters,
 
 		async execute(_toolCallId, params) {
-			let phaseData: unknown;
-			try {
-				phaseData = JSON.parse(params.phase_data);
-			} catch {
-				phaseData = params.phase_data;
-			}
-
-			const result = planningEngine.processPhase({
-				phase: params.phase,
-				thought: params.thought,
-				sessionId: params.session_id,
-				isRevision: params.is_revision,
-				confidence: params.confidence,
-				phaseData,
-			});
+			const budget = params.budget || "standard";
+			const complexityLevel = budget === "quick" ? 1 : budget === "deep" ? 3 : 2;
+			const knownUrls = params.known_urls || [];
+			const combinedQuestion = [
+				params.question,
+				...(params.sub_queries || []).map((subQuery) => subQuery.question),
+			].join(" ");
+			const docsApiIntent = /\b(api|sdk|docs?|documentation|reference|framework|library|github|readme|changelog|migration)\b|文档|接口|框架|代码库|迁移/i.test(combinedQuestion);
+			const defaultTool = knownUrls.length > 0
+				? "web_fetch"
+				: docsApiIntent
+					? "docs_search"
+					: "search";
+			const subQueries = params.sub_queries?.length
+				? params.sub_queries.map((subQuery, index) => ({
+					id: subQuery.id || `sq${index + 1}`,
+					goal: subQuery.question,
+					reason: subQuery.reason,
+					expected_output: "Fetched evidence or source-backed findings",
+					boundary: "Stay within this sub-question and avoid unsupported claims",
+					tool_hint: subQuery.tool || defaultTool,
+					query: subQuery.query || subQuery.question,
+				}))
+				: [{
+					id: "sq1",
+					goal: params.question,
+					reason: "Answer the primary research question with source-backed evidence",
+					expected_output: "A concise evidence-backed answer",
+					boundary: "Do not expand beyond the requested scope",
+					tool_hint: defaultTool,
+					query: knownUrls[0] || params.question,
+				}];
+			const toolMappings = subQueries.map((subQuery) => ({
+				sub_query_id: subQuery.id,
+				tool: subQuery.tool_hint,
+				reason: subQuery.reason,
+				params: subQuery.tool_hint === "web_fetch"
+					? { url: subQuery.query }
+					: { query: subQuery.query },
+			}));
+			const session: PlanningSession = {
+				sessionId: newSessionId(),
+				complexityLevel,
+				phases: {
+					intent_analysis: {
+						phase: "intent_analysis",
+						thought: "Normalized one-shot research intent",
+						confidence: 1,
+						data: {
+							core_question: params.question,
+							query_type: params.claim_risk === "high" ? "fact_check" : "analytical",
+							time_sensitivity: params.recency_requirement || "none",
+							locale_domain_scope: params.locale_domain_scope || "global",
+							source_authority_need: params.source_authority_need || "high",
+							claim_risk: params.claim_risk || (complexityLevel === 3 ? "high" : "medium"),
+							cross_validation_need: params.cross_validation_need || (complexityLevel === 3 ? "high" : "normal"),
+							known_urls: knownUrls,
+						},
+					},
+					complexity_assessment: {
+						phase: "complexity_assessment",
+						thought: "Mapped the requested research budget to bounded execution",
+						confidence: 1,
+						data: { level: complexityLevel, budget },
+					},
+					query_decomposition: {
+						phase: "query_decomposition",
+						thought: "Used caller-supplied sub-questions or a bounded default",
+						confidence: 1,
+						data: subQueries,
+					},
+					search_strategy: {
+						phase: "search_strategy",
+						thought: "Prepared one tool query per sub-question",
+						confidence: 1,
+						data: {
+							approach: budget === "deep" ? "broad_first" : "targeted",
+							search_terms: subQueries.map((subQuery, index) => ({
+								term: subQuery.query,
+								purpose: subQuery.id,
+								round: index + 1,
+							})),
+						},
+					},
+					tool_selection: {
+						phase: "tool_selection",
+						thought: "Mapped each sub-question to the narrowest matching capability",
+						confidence: 1,
+						data: toolMappings,
+					},
+					execution_order: {
+						phase: "execution_order",
+						thought: "Execute discovery first and fetch key pages before final claims",
+						confidence: 1,
+						data: {
+							parallel: budget === "deep" ? [subQueries.map((subQuery) => subQuery.id)] : [],
+							sequential: budget === "deep" ? [] : subQueries.map((subQuery) => subQuery.id),
+							estimated_rounds: budget === "deep" ? 2 : 1,
+						},
+					},
+				},
+			};
+			const researchPlan = buildResearchPlan(session);
+			const addedTools = activateSearchTools(toolMappings.map((mapping) => String(mapping.tool)));
+			const result = {
+				plan_complete: true,
+				research_plan: researchPlan,
+				activated_plan_tools: addedTools,
+			};
 
 			return {
 				content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
@@ -4938,9 +5103,8 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// =========================================================================
-	// Strongly typed planning tools — wrappers around search_planning.
-	// =========================================================================
+	// Legacy multi-call planning tools remain opt-in for compatibility.
+	if (process.env.PI_SEARCH_ENABLE_LEGACY_PLANNING_TOOLS === "1") {
 	pi.registerTool({
 		name: "plan_intent",
 		label: "Plan Intent",
@@ -5180,6 +5344,7 @@ export default function (pi: ExtensionAPI) {
 			return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], details: result };
 		},
 	});
+	}
 
 	// =========================================================================
 	// Command: /search

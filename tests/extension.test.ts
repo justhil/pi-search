@@ -47,15 +47,27 @@ type ToolContext = {
 class FakePi {
 	tools = new Map<string, RegisteredTool>();
 	commands = new Map<string, RegisteredCommand>();
-	events = new Map<string, EventHandler>();
+	events = new Map<string, EventHandler[]>();
 	renderers = new Map<string, MessageRenderer>();
+	activeTools = new Set<string>(["read", "bash"]);
 
 	on(name: string, handler: EventHandler) {
-		this.events.set(name, handler);
+		const handlers = this.events.get(name) || [];
+		handlers.push(handler);
+		this.events.set(name, handlers);
 	}
 
 	registerTool(tool: RegisteredTool) {
 		this.tools.set(tool.name, tool);
+		this.activeTools.add(tool.name);
+	}
+
+	getActiveTools() {
+		return [...this.activeTools];
+	}
+
+	setActiveTools(toolNames: string[]) {
+		this.activeTools = new Set(toolNames);
 	}
 
 	registerCommand(name: string, command: RegisteredCommand) {
@@ -91,6 +103,8 @@ const ENV_KEYS = [
 	"PI_SEARCH_CONTEXT7_CACHE_DIR",
 	"CONTEXT7_RESOLVE_TTL_HOURS",
 	"CONTEXT7_DOCS_TTL_HOURS",
+	"PI_SEARCH_ENABLE_LEGACY_PLANNING_TOOLS",
+	"PI_SEARCH_DEFERRED_TOOLS",
 ];
 
 const originalFetch = globalThis.fetch;
@@ -169,10 +183,11 @@ afterEach(() => {
 });
 
 describe("pi-search extension", () => {
-	it("registers the enhanced search tools", () => {
+	it("registers the enhanced search tools without legacy planning tools by default", () => {
 		const pi = installExtension();
 
 		expect([...pi.tools.keys()]).toEqual(expect.arrayContaining([
+			"search_tools",
 			"search",
 			"context7_resolve_library_id",
 			"context7_query_docs",
@@ -184,8 +199,54 @@ describe("pi-search extension", () => {
 			"web_map",
 			"search_config",
 			"search_planning",
-			"plan_tool_mapping",
 		]));
+		expect(pi.tools.has("plan_tool_mapping")).toBe(false);
+	});
+
+	it("keeps only core search tools active until capabilities are requested", async () => {
+		const pi = installExtension();
+		for (const handler of pi.events.get("session_start") || []) {
+			await handler({}, testContext());
+		}
+
+		expect(pi.getActiveTools()).toEqual(expect.arrayContaining([
+			"read",
+			"bash",
+			"search_tools",
+			"search",
+			"docs_search",
+			"web_fetch",
+		]));
+		expect(pi.getActiveTools()).not.toEqual(expect.arrayContaining([
+			"context7_query_docs",
+			"search_sources",
+			"web_map",
+			"search_config",
+			"search_planning",
+		]));
+
+		const result = await runTool(pi, "search_tools", {
+			capabilities: ["context7", "planning"],
+		});
+		expect(result.details?.added_tools).toEqual(expect.arrayContaining([
+			"context7_resolve_library_id",
+			"context7_query_docs",
+			"context7_get_library_docs",
+			"context7_get_cached_doc_raw",
+			"search_planning",
+		]));
+		expect(pi.getActiveTools()).toEqual(expect.arrayContaining([
+			"context7_query_docs",
+			"search_planning",
+		]));
+	});
+
+	it("can restore legacy multi-call planning tools explicitly", () => {
+		process.env.PI_SEARCH_ENABLE_LEGACY_PLANNING_TOOLS = "1";
+		const pi = installExtension();
+
+		expect(pi.tools.has("plan_intent")).toBe(true);
+		expect(pi.tools.has("plan_tool_mapping")).toBe(true);
 	});
 
 	it("resolves Context7 library IDs like the official MCP flow", async () => {
@@ -541,6 +602,10 @@ describe("pi-search extension", () => {
 		expect(result.content[0]?.text).toContain("React useEffect cleanup answer");
 		expect(result.content[0]?.text).toContain("React");
 		expect(result.details?.docs_search_enriched).toBe(true);
+		expect(result.details?.evidence_level).toBe("discovery");
+		expect(result.details?.source_warning).toContain("web_fetch");
+		expect(result.details?.providers_used).toEqual(expect.arrayContaining(["openai_compatible", "context7"]));
+		expect(pi.getActiveTools()).toContain("search_sources");
 		expect(result.details?.provider_attempts).toEqual(expect.arrayContaining([
 			expect.objectContaining({ capability: "main_search", provider: "openai_compatible", ok: true }),
 			expect.objectContaining({ capability: "docs_search", provider: "context7", ok: true }),
@@ -599,56 +664,38 @@ describe("pi-search extension", () => {
 		expect(result.content[0]?.text).toContain("Fallback Mode");
 		expect(result.details?.fallbackMode).toBe("auto");
 		expect(result.details?.minimumProfile).toBe("standard");
+		expect(result.details).not.toHaveProperty("searchApiKey");
+		expect(result.details).not.toHaveProperty("context7ApiKey");
+		expect(result.details).not.toHaveProperty("exaApiKey");
 	});
 
-	it("builds an offline research_plan with docs_search capability", async () => {
+	it("builds a one-shot offline research_plan with smart-search evidence boundaries", async () => {
 		const pi = installExtension();
-		const intent = await runTool(pi, "plan_intent", {
-			core_question: "How does React useEffect cleanup work?",
-			query_type: "factual",
-			time_sensitivity: "irrelevant",
-			thought: "Need official API docs.",
-		});
-		const sessionId = String(intent.details?.session_id);
-
-		await runTool(pi, "plan_complexity", {
-			session_id: sessionId,
-			level: 2,
-			estimated_sub_queries: 1,
-			estimated_tool_calls: 2,
-			justification: "Needs docs and source fetch.",
-			thought: "Moderate docs lookup.",
-		});
-		await runTool(pi, "plan_sub_query", {
-			session_id: sessionId,
-			id: "sq1",
-			goal: "Find official React useEffect cleanup docs",
-			expected_output: "Official API semantics",
-			boundary: "No blog-only sources",
-			tool_hint: "docs_search",
-			thought: "Docs-first subquery.",
-		});
-		await runTool(pi, "plan_search_term", {
-			session_id: sessionId,
-			term: "React useEffect cleanup docs",
-			purpose: "sq1",
-			round: 1,
-			thought: "Use official docs query.",
-		});
-		const final = await runTool(pi, "plan_tool_mapping", {
-			session_id: sessionId,
-			sub_query_id: "sq1",
-			tool: "docs_search",
-			reason: "Official API docs are required.",
-			thought: "Map to docs search.",
+		const result = await runTool(pi, "search_planning", {
+			question: "How does React useEffect cleanup work?",
+			budget: "deep",
+			recency_requirement: "recent",
+			source_authority_need: "high",
+			claim_risk: "medium",
+			cross_validation_need: "high",
+			sub_queries: [{
+				id: "sq1",
+				question: "Find official React useEffect cleanup docs",
+				reason: "Official API semantics are required",
+				tool: "docs_search",
+			}],
 		});
 
-		expect(final.details?.plan_complete).toBe(true);
-		expect(final.details?.research_plan).toEqual(expect.objectContaining({
+		expect(result.details?.plan_complete).toBe(true);
+		expect(result.details?.research_plan).toEqual(expect.objectContaining({
 			mode: "deep_research",
+			query_mode: "deep",
+			trigger_source: "explicit_tool",
 			evidence_policy: "fetch_before_claim",
+			preflight: expect.objectContaining({ tool: "search_config" }),
+			gap_check: expect.objectContaining({ required: true }),
 		}));
-		expect(final.content[0]?.text).toContain("docs_search");
-		expect(final.content[0]?.text).toContain("Offline plan only");
+		expect(result.content[0]?.text).toContain("docs_search");
+		expect(result.content[0]?.text).toContain("Offline plan only");
 	});
 });
