@@ -19,10 +19,10 @@
  *   - CLI 命令: /search, /search-config, /search-model, /pi-ext-docs
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { keyHint, type AgentToolResult, type ExtensionAPI, type Theme } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { Text } from "@earendil-works/pi-tui";
+import { Text, type Component } from "@earendil-works/pi-tui";
 // defuddle/node only exports the ESM "import" condition (no "require").
 // Pi loads extensions via CJS require, so a static import becomes require("defuddle/node")
 // and fails at extension load time. Load it lazily with dynamic import() instead.
@@ -200,6 +200,42 @@ interface SearchControlInput {
 	max_answer_chars?: number;
 	max_sources?: number;
 	max_output_bytes?: number;
+}
+
+const SEARCH_PREVIEW_LINES = 12;
+const SEARCH_PREVIEW_CHARS = 4000;
+
+function renderPiSearchResult(
+	result: AgentToolResult<unknown>,
+	{ expanded, isPartial }: { expanded: boolean; isPartial: boolean },
+	theme: Theme,
+): Component {
+	if (isPartial) {
+		return new Text(theme.fg("warning", "Processing..."), 0, 0);
+	}
+
+	const output = result.content
+		.filter((block) => block.type === "text")
+		.map((block) => block.text || "")
+		.join("\n")
+		.replace(/\r/g, "");
+	if (!output) return new Text("", 0, 0);
+
+	const lines = output.split("\n");
+	const visibleLines = expanded ? lines : lines.slice(0, SEARCH_PREVIEW_LINES);
+	let display = visibleLines.join("\n");
+	let hiddenLines = expanded ? 0 : Math.max(0, lines.length - visibleLines.length);
+
+	if (!expanded && display.length > SEARCH_PREVIEW_CHARS) {
+		display = display.slice(0, SEARCH_PREVIEW_CHARS).trimEnd();
+		hiddenLines = Math.max(hiddenLines, 1);
+	}
+
+	if (!expanded && hiddenLines > 0) {
+		display += `\n${theme.fg("muted", `... (${hiddenLines} more lines,`)} ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
+	}
+
+	return new Text(theme.fg("toolOutput", display), 0, 0);
 }
 
 interface PlanningSession {
@@ -3867,6 +3903,7 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 	pi.registerTool<typeof searchToolsParameters, Record<string, unknown>>({
 		name: "search_tools",
+		renderResult: renderPiSearchResult,
 		label: "Search Tools",
 		description:
 			"按需激活额外 Pi Search 工具组，减少普通轮次的工具定义和选择噪音。" +
@@ -3905,6 +3942,7 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 	pi.registerTool({
 		name: "search",
+		renderResult: renderPiSearchResult,
 		label: "Pi Search",
 		description:
 			"通过 OpenAI-compatible Search API 执行 AI 驱动的深度网络搜索。自动检测时间相关查询并注入时间上下文。\n" +
@@ -4137,6 +4175,7 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 	pi.registerTool({
 		name: "context7_resolve_library_id",
+		renderResult: renderPiSearchResult,
 		label: "Context7 Resolve Library ID",
 		description:
 			"解析包名/产品名到 Context7-compatible library ID。\n" +
@@ -4219,6 +4258,7 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 	pi.registerTool({
 		name: "context7_query_docs",
+		renderResult: renderPiSearchResult,
 		label: "Context7 Query Docs",
 		description:
 			"使用 Context7 libraryId 查询最新文档和代码片段。\n" +
@@ -4279,6 +4319,7 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 	pi.registerTool({
 		name: "context7_get_library_docs",
+		renderResult: renderPiSearchResult,
 		label: "Context7 Get Library Docs",
 		description:
 			"Context7-only 文档获取工具。支持传入精确 libraryId，或用 libraryName 自动解析后获取文档；带本地 TTL 缓存和 docRef。",
@@ -4368,6 +4409,7 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 	pi.registerTool({
 		name: "context7_get_cached_doc_raw",
+		renderResult: renderPiSearchResult,
 		label: "Context7 Cached Doc Raw",
 		description:
 			"读取 Context7 本地缓存的完整原始文档 JSON。可用 docRef 精确读取，也可按 query/libraryId 做轻量语义匹配。",
@@ -4435,6 +4477,7 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 	pi.registerTool({
 		name: "docs_search",
+		renderResult: renderPiSearchResult,
 		label: "Docs Search",
 		description:
 			"通过 Context7 和 Exa 检索官方文档、SDK/API、框架资料、GitHub 与高可信技术来源。\n" +
@@ -4510,6 +4553,7 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 	pi.registerTool({
 		name: "search_sources",
+		renderResult: renderPiSearchResult,
 		label: "Search Sources",
 		description:
 			"通过 session_id 分页获取之前 search 缓存的信源列表。\n" +
@@ -4593,6 +4637,7 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 	pi.registerTool({
 		name: "web_fetch",
+		renderResult: renderPiSearchResult,
 		label: "Web Fetch",
 		description:
 			"独立抓取一个明确的 HTTP/HTTPS URL，并返回受输出预算保护的页面/API 预览。\n" +
@@ -4749,6 +4794,7 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 	pi.registerTool({
 		name: "web_map",
+		renderResult: renderPiSearchResult,
 		label: "Web Map",
 		description:
 			"通过 Tavily Map API 遍历网站结构，发现 URL 并生成站点地图。\n" +
@@ -4840,6 +4886,7 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 	pi.registerTool<typeof searchConfigParameters, Record<string, unknown>>({
 		name: "search_config",
+		renderResult: renderPiSearchResult,
 		label: "Search Config",
 		description:
 			"只读查看 Pi Search 的掩码配置与能力状态，或在用户明确要求时测试 provider 连接。配置修改必须使用 /search-config。",
@@ -5001,6 +5048,7 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 	pi.registerTool<typeof searchPlanningParameters, Record<string, unknown>>({
 		name: "search_planning",
+		renderResult: renderPiSearchResult,
 		label: "Search Planning",
 		description:
 			"一次调用生成离线 research_plan，不执行搜索、不抓取网页。仅用于显式深度调研、多源核验或复杂比较任务。",
@@ -5134,6 +5182,7 @@ export default function (pi: ExtensionAPI) {
 	if (process.env.PI_SEARCH_ENABLE_LEGACY_PLANNING_TOOLS === "1") {
 	pi.registerTool({
 		name: "plan_intent",
+		renderResult: renderPiSearchResult,
 		label: "Plan Intent",
 		description:
 			"Phase 1 of search planning: analyze user intent. Call this first to create a planning session.",
@@ -5178,6 +5227,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "plan_complexity",
+		renderResult: renderPiSearchResult,
 		label: "Plan Complexity",
 		description: "Phase 2: assess search complexity from 1 to 3 and determine required phases.",
 		promptSnippet: "Phase 2 search planning: assess complexity",
@@ -5215,6 +5265,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "plan_sub_query",
+		renderResult: renderPiSearchResult,
 		label: "Plan Sub-query",
 		description: "Phase 3: add one sub-query. Call once per sub-query; data accumulates.",
 		promptSnippet: "Phase 3 search planning: add a sub-query",
@@ -5257,6 +5308,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "plan_search_term",
+		renderResult: renderPiSearchResult,
 		label: "Plan Search Term",
 		description: "Phase 4: add one search term. Call once per term; data accumulates.",
 		promptSnippet: "Phase 4 search planning: add a search term",
@@ -5295,6 +5347,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "plan_tool_mapping",
+		renderResult: renderPiSearchResult,
 		label: "Plan Tool Mapping",
 		description: "Phase 5: map a sub-query to a tool. Call once per mapping; data accumulates.",
 		promptSnippet: "Phase 5 search planning: map sub-query to tool",
@@ -5339,6 +5392,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "plan_execution",
+		renderResult: renderPiSearchResult,
 		label: "Plan Execution",
 		description: "Phase 6: define execution order for sub-queries.",
 		promptSnippet: "Phase 6 search planning: define execution order",

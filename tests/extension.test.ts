@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { initTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const smartFetchMock = vi.hoisted(() => vi.fn());
 const defuddleMock = vi.hoisted(() => vi.fn());
@@ -23,6 +23,7 @@ type ToolResult = {
 type RegisteredTool = {
 	name: string;
 	parameters?: unknown;
+	renderResult?: (...args: any[]) => { render: (width: number) => string[] };
 	execute: (...args: unknown[]) => unknown;
 };
 
@@ -201,6 +202,29 @@ describe("pi-search extension", () => {
 			"search_planning",
 		]));
 		expect(pi.tools.has("plan_tool_mapping")).toBe(false);
+		expect([...pi.tools.values()].every((tool) => typeof tool.renderResult === "function")).toBe(true);
+	});
+
+	it("supports Ctrl+O expansion for Pi Search tool output", () => {
+		initTheme();
+		const pi = installExtension();
+		const renderer = pi.tools.get("search_planning")?.renderResult;
+		expect(renderer).toBeDefined();
+
+		const result = {
+			content: [{
+				type: "text",
+				text: Array.from({ length: 20 }, (_, index) => `line-${index}`).join("\n"),
+			}],
+			details: {},
+		};
+		const theme = { fg: (_color: string, text: string) => text };
+		const collapsed = renderer!(result, { expanded: false, isPartial: false }, theme, {}).render(120).join("\n");
+		const expanded = renderer!(result, { expanded: true, isPartial: false }, theme, {}).render(120).join("\n");
+
+		expect(collapsed).toContain("line-0");
+		expect(collapsed).not.toContain("line-19");
+		expect(expanded).toContain("line-19");
 	});
 
 	it("keeps only core search tools active until capabilities are requested", async () => {
