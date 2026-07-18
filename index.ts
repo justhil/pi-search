@@ -23,7 +23,9 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
-import { Defuddle } from "defuddle/node";
+// defuddle/node only exports the ESM "import" condition (no "require").
+// Pi loads extensions via CJS require, so a static import becomes require("defuddle/node")
+// and fails at extension load time. Load it lazily with dynamic import() instead.
 import type { DefuddleResponse } from "defuddle/node";
 import { parseHTML } from "linkedom";
 import { fetch as wreqFetch } from "wreq-js";
@@ -32,6 +34,30 @@ import { appendFile, readFile, writeFile, mkdir, readdir } from "node:fs/promise
 import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
+
+type DefuddleExtractFn = (
+	input: Document | string | {
+		window: {
+			document: Document;
+			location: { href: string };
+		};
+	},
+	url?: string,
+	options?: {
+		markdown?: boolean;
+		removeImages?: boolean;
+		includeReplies?: boolean | "extractors";
+	},
+) => Promise<DefuddleResponse>;
+
+let defuddleExtractPromise: Promise<DefuddleExtractFn> | null = null;
+
+async function loadDefuddleExtract(): Promise<DefuddleExtractFn> {
+	if (!defuddleExtractPromise) {
+		defuddleExtractPromise = import("defuddle/node").then((module) => module.Defuddle as DefuddleExtractFn);
+	}
+	return defuddleExtractPromise;
+}
 
 // =============================================================================
 // Types
@@ -3125,7 +3151,8 @@ async function smartDirectFetch(
 		if (!html.trim()) return null;
 		const finalUrl = metadata.finalUrl || targetUrl;
 		const document = parseSmartDirectHtml(html, finalUrl);
-		const extracted = await Defuddle(document, finalUrl, {
+		const extractWithDefuddle = await loadDefuddleExtract();
+		const extracted = await extractWithDefuddle(document, finalUrl, {
 			markdown: format !== "html",
 			removeImages: options.removeImages,
 			includeReplies: options.includeReplies,
