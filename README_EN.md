@@ -70,7 +70,9 @@ After installation, run `/search-config` in pi for interactive configuration, or
 # Search API (required, OpenAI-compatible /chat/completions)
 export SEARCH_API_URL="https://api.example.com/v1"
 export SEARCH_API_KEY="your-api-key"
+export SEARCH_API_PROTOCOL="completions"  # completions | responses (openai-completions / openai-responses)
 export SEARCH_MODEL="your-search-model"
+export SEARCH_THINKING_LEVEL="off"  # off | minimal | low | medium | high | xhigh | max
 
 # Tavily (optional, improves web_fetch and provides web_map)
 export TAVILY_API_KEY="tvly-your-key"
@@ -87,7 +89,7 @@ In pi, type:
 /search-config
 ```
 
-Supports: view config, set Search API/Tavily/Firecrawl API, switch model, switch search profile, test connections.
+Supports: view config, set Search API (including completions/responses protocol), switch API protocol, set Tavily/Firecrawl API, switch model (then configure thinking level), switch thinking level, switch search profile, test connections.
 
 ### Config File
 
@@ -97,7 +99,9 @@ Persisted to `~/.config/pi-search/config.json`:
 {
   "apiUrl": "https://api.example.com/v1",
   "apiKey": "your-api-key",
+  "apiProtocol": "completions",
   "model": "your-search-model",
+  "thinkingLevel": "off",
   "searchProfile": "auto",
   "tavilyApiKey": "tvly-your-key",
   "firecrawlApiKey": "fc-your-key"
@@ -112,7 +116,7 @@ Persisted to `~/.config/pi-search/config.json`:
 | ------- | ----------- |
 | `/search <query>` | Search the web |
 | `/search-config` | Interactive configuration |
-| `/search-model [model-id]` | Switch search model |
+| `/search-model [model-id] [thinking-level]` | Switch search model; after selection, configure thinking level (off/minimal/low/medium/high/xhigh/max) |
 | `/pi-ext-docs [topic]` | Search pi Extension docs |
 
 ### Tools (Auto-invoked by LLM)

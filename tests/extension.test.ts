@@ -86,7 +86,9 @@ class FakePi {
 const ENV_KEYS = [
 	"SEARCH_API_URL",
 	"SEARCH_API_KEY",
+	"SEARCH_API_PROTOCOL",
 	"SEARCH_MODEL",
+	"SEARCH_THINKING_LEVEL",
 	"SEARCH_PROFILE",
 	"SEARCH_FALLBACK_MODE",
 	"SEARCH_MINIMUM_PROFILE",
@@ -662,11 +664,167 @@ describe("pi-search extension", () => {
 		expect(result.content[0]?.text).toContain("Capability Status");
 		expect(result.content[0]?.text).toContain("docs_search");
 		expect(result.content[0]?.text).toContain("Fallback Mode");
+		expect(result.content[0]?.text).toContain("思考等级");
+		expect(result.content[0]?.text).toContain("API 协议");
 		expect(result.details?.fallbackMode).toBe("auto");
 		expect(result.details?.minimumProfile).toBe("standard");
+		expect(result.details?.thinkingLevel).toBe("off");
+		expect(result.details?.searchApiProtocol).toBe("completions");
 		expect(result.details).not.toHaveProperty("searchApiKey");
 		expect(result.details).not.toHaveProperty("context7ApiKey");
 		expect(result.details).not.toHaveProperty("exaApiKey");
+	});
+
+	it("sends reasoning_effort when thinking_level is set for search", async () => {
+		process.env.SEARCH_THINKING_LEVEL = "high";
+		let requestBody: Record<string, unknown> | undefined;
+		const fetchMock = vi.fn(async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+			const url = String(input);
+			if (url === "https://search.test/v1/chat/completions") {
+				requestBody = JSON.parse(String(init?.body || "{}")) as Record<string, unknown>;
+				return textResponse('data: {"choices":[{"delta":{"content":"Answer with thinking."}}]}\n\ndata: [DONE]\n');
+			}
+			throw new Error(`Unhandled fetch: ${url}`);
+		}) as typeof fetch;
+		globalThis.fetch = fetchMock;
+
+		const result = await runTool(installExtension(), "search", {
+			query: "test thinking level",
+			profile: "auto",
+			max_sources: 0,
+		});
+
+		expect(result.content[0]?.text).toContain("Answer with thinking");
+		expect(result.details?.thinking_level).toBe("high");
+		expect(result.details?.api_protocol).toBe("completions");
+		expect(requestBody?.reasoning_effort).toBe("high");
+		expect(requestBody?.model).toBe("search-model");
+	});
+
+	it("uses Responses API endpoint and reasoning.effort when protocol is responses", async () => {
+		process.env.SEARCH_API_PROTOCOL = "responses";
+		process.env.SEARCH_THINKING_LEVEL = "medium";
+		let requestUrl = "";
+		let requestBody: Record<string, unknown> | undefined;
+		const fetchMock = vi.fn(async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+			requestUrl = String(input);
+			if (requestUrl === "https://search.test/v1/responses") {
+				requestBody = JSON.parse(String(init?.body || "{}")) as Record<string, unknown>;
+				return textResponse(
+					'data: {"type":"response.output_text.delta","delta":"Hello from responses"}\n\ndata: [DONE]\n',
+				);
+			}
+			throw new Error(`Unhandled fetch: ${requestUrl}`);
+		}) as typeof fetch;
+		globalThis.fetch = fetchMock;
+
+		const result = await runTool(installExtension(), "search", {
+			query: "responses protocol",
+			max_sources: 0,
+		});
+
+		expect(requestUrl).toBe("https://search.test/v1/responses");
+		expect(result.content[0]?.text).toContain("Hello from responses");
+		expect(result.details?.api_protocol).toBe("responses");
+		expect(requestBody?.input).toBeDefined();
+		expect(requestBody?.instructions).toBeDefined();
+		expect(requestBody).not.toHaveProperty("messages");
+		expect(requestBody?.reasoning).toEqual({ effort: "medium" });
+	});
+
+	it("omits reasoning_effort when thinking_level is off", async () => {
+		process.env.SEARCH_THINKING_LEVEL = "off";
+		let requestBody: Record<string, unknown> | undefined;
+		const fetchMock = vi.fn(async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+			const url = String(input);
+			if (url === "https://search.test/v1/chat/completions") {
+				requestBody = JSON.parse(String(init?.body || "{}")) as Record<string, unknown>;
+				return textResponse('data: {"choices":[{"delta":{"content":"No thinking."}}]}\n\ndata: [DONE]\n');
+			}
+			throw new Error(`Unhandled fetch: ${url}`);
+		}) as typeof fetch;
+		globalThis.fetch = fetchMock;
+
+		const result = await runTool(installExtension(), "search", {
+			query: "test off thinking",
+			max_sources: 0,
+		});
+
+		expect(result.details?.thinking_level).toBe("off");
+		expect(requestBody).not.toHaveProperty("reasoning_effort");
+	});
+
+	it("allows per-request thinking_level override on search tool", async () => {
+		process.env.SEARCH_THINKING_LEVEL = "low";
+		let requestBody: Record<string, unknown> | undefined;
+		const fetchMock = vi.fn(async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+			const url = String(input);
+			if (url === "https://search.test/v1/chat/completions") {
+				requestBody = JSON.parse(String(init?.body || "{}")) as Record<string, unknown>;
+				return textResponse('data: {"choices":[{"delta":{"content":"Override."}}]}\n\ndata: [DONE]\n');
+			}
+			throw new Error(`Unhandled fetch: ${url}`);
+		}) as typeof fetch;
+		globalThis.fetch = fetchMock;
+
+		const result = await runTool(installExtension(), "search", {
+			query: "override thinking",
+			thinking_level: "xhigh",
+			max_sources: 0,
+		});
+
+		expect(result.details?.thinking_level).toBe("xhigh");
+		expect(requestBody?.reasoning_effort).toBe("xhigh");
+	});
+
+	it("search-model interactive flow prompts for thinking level after model", async () => {
+		const selects: Array<{ title: string; items: string[] }> = [];
+		const notifies: string[] = [];
+		const fetchMock = vi.fn(async (input: Parameters<typeof fetch>[0]) => {
+			const url = String(input);
+			if (url === "https://search.test/v1/models") {
+				return jsonResponse({ data: [{ id: "model-a" }, { id: "model-b" }] });
+			}
+			throw new Error(`Unhandled fetch: ${url}`);
+		}) as typeof fetch;
+		globalThis.fetch = fetchMock;
+
+		const pi = installExtension();
+		const command = pi.commands.get("search-model");
+		expect(command).toBeDefined();
+
+		await command!.handler("", {
+			ui: {
+				setStatus: () => undefined,
+				notify: (text: string) => {
+					notifies.push(text);
+				},
+				select: async (title: string, items: string[]) => {
+					selects.push({ title, items });
+					if (title.startsWith("当前:")) return "model-b";
+					if (title.includes("思考等级")) {
+						const high = items.find((item) => item.includes("high") && !item.includes("xhigh"));
+						return high || "  high";
+					}
+					return undefined;
+				},
+				input: async () => undefined,
+			},
+		});
+
+		expect(selects.length).toBe(2);
+		expect(selects[0]?.items).toEqual(expect.arrayContaining(["model-a", "model-b"]));
+		expect(selects[1]?.title).toContain("思考等级");
+		expect(notifies.some((n) => n.includes("model-b") && n.includes("high"))).toBe(true);
+
+		const configPath = process.env.PI_SEARCH_CONFIG_PATH!;
+		const { readFile } = await import("node:fs/promises");
+		const saved = JSON.parse(await readFile(configPath, "utf-8")) as {
+			model?: string;
+			thinkingLevel?: string;
+		};
+		expect(saved.model).toBe("model-b");
+		expect(saved.thinkingLevel).toBe("high");
 	});
 
 	it("builds a one-shot offline research_plan with smart-search evidence boundaries", async () => {

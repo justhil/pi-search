@@ -71,7 +71,9 @@ pi -e git:github.com/justhil/pi-search
 # Search API（必填，OpenAI-compatible /chat/completions）
 export SEARCH_API_URL="https://api.example.com/v1"
 export SEARCH_API_KEY="your-api-key"
+export SEARCH_API_PROTOCOL="completions"  # completions | responses（openai-completions / openai-responses）
 export SEARCH_MODEL="your-search-model"
+export SEARCH_THINKING_LEVEL="off"  # off | minimal | low | medium | high | xhigh | max
 
 # Context7（可选 API Key；默认 base URL 可公开访问时用于 docs_search/context7_*）
 export CONTEXT7_BASE_URL="https://context7.com"
@@ -104,7 +106,7 @@ export PI_SEARCH_ENABLE_LEGACY_PLANNING_TOOLS="0" # 默认 0；设为 1 恢复�
 /search-config
 ```
 
-支持：查看配置、设置 Search API/Context7/Exa/Tavily/Firecrawl API、设置 Context7 Cache TTL、切换模型、切换搜索模式、Fallback Mode、Minimum Profile、测试连接。
+支持：查看配置、设置 Search API（含协议 completions/responses）、切换 API 协议、设置 Context7/Exa/Tavily/Firecrawl API、设置 Context7 Cache TTL、切换模型（选完模型后可配置思考等级）、切换思考等级、切换搜索模式、Fallback Mode、Minimum Profile、测试连接。
 
 ### 配置文件
 
@@ -114,7 +116,9 @@ export PI_SEARCH_ENABLE_LEGACY_PLANNING_TOOLS="0" # 默认 0；设为 1 恢复�
 {
   "apiUrl": "https://api.example.com/v1",
   "apiKey": "your-api-key",
+  "apiProtocol": "completions",
   "model": "your-search-model",
+  "thinkingLevel": "off",
   "searchProfile": "auto",
   "fallbackMode": "auto",
   "minimumProfile": "standard",
@@ -137,7 +141,7 @@ export PI_SEARCH_ENABLE_LEGACY_PLANNING_TOOLS="0" # 默认 0；设为 1 恢复�
 | ---- | ---- |
 | `/search <query>` | 搜索网络信息 |
 | `/search-config` | 交互式配置管理 |
-| `/search-model [model-id]` | 切换搜索模型 |
+| `/search-model [model-id] [thinking-level]` | 切换搜索模型；交互选择后可配置思考等级（off/minimal/low/medium/high/xhigh/max） |
 | `/pi-ext-docs [topic]` | 搜索 pi Extension 开发文档 |
 
 ### 工具（LLM 自动调用）

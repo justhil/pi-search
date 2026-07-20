@@ -77,10 +77,46 @@ const DEFAULT_SEARCH_API_URL = "https://api.openai.com/v1";
 const CONTEXT7_DEFAULT_RESOLVE_TTL_HOURS = 168;
 const CONTEXT7_DEFAULT_DOCS_TTL_HOURS = 24;
 
+const THINKING_LEVEL_VALUES = [
+	"off",
+	"minimal",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+] as const;
+
+type ThinkingLevel = (typeof THINKING_LEVEL_VALUES)[number];
+const DEFAULT_THINKING_LEVEL: ThinkingLevel = "off";
+
+/** Search model API wire protocol (OpenAI-compatible). */
+const SEARCH_API_PROTOCOL_VALUES = ["completions", "responses"] as const;
+type SearchApiProtocol = (typeof SEARCH_API_PROTOCOL_VALUES)[number];
+const DEFAULT_SEARCH_API_PROTOCOL: SearchApiProtocol = "completions";
+
+const SEARCH_API_PROTOCOL_DEFS: Record<
+	SearchApiProtocol,
+	{ label: string; endpoint: string; description: string }
+> = {
+	completions: {
+		label: "Chat Completions",
+		endpoint: "/chat/completions",
+		description: "OpenAI Chat Completions（openai-completions，最通用）",
+	},
+	responses: {
+		label: "Responses",
+		endpoint: "/responses",
+		description: "OpenAI Responses API（openai-responses）",
+	},
+};
+
 interface SearchConfigFile {
 	apiUrl?: string;
 	apiKey?: string;
+	apiProtocol?: SearchApiProtocol;
 	model?: string;
+	thinkingLevel?: ThinkingLevel;
 	searchProfile?: SearchProfile;
 	fallbackMode?: FallbackMode;
 	minimumProfile?: MinimumProfile;
@@ -99,7 +135,9 @@ interface SearchConfigFile {
 interface RuntimeConfig {
 	searchApiUrl: string;
 	searchApiKey: string;
+	searchApiProtocol: SearchApiProtocol;
 	searchModel: string;
+	thinkingLevel: ThinkingLevel;
 	searchProfile: SearchProfile;
 	fallbackMode: FallbackMode;
 	minimumProfile: MinimumProfile;
@@ -620,9 +658,15 @@ class ConfigManager {
 		return {
 			searchApiUrl,
 			searchApiKey: process.env.SEARCH_API_KEY || file.apiKey || "",
+			searchApiProtocol: normalizeSearchApiProtocol(
+				process.env.SEARCH_API_PROTOCOL || file.apiProtocol,
+			),
 			searchModel: normalizeSearchModel(
 				process.env.SEARCH_MODEL || file.model || "",
 				searchApiUrl,
+			),
+			thinkingLevel: normalizeThinkingLevel(
+				process.env.SEARCH_THINKING_LEVEL || file.thinkingLevel,
 			),
 			searchProfile: normalizeSearchProfile(
 				process.env.SEARCH_PROFILE || file.searchProfile,
@@ -673,16 +717,29 @@ class ConfigManager {
 		await this.saveFile(file);
 	}
 
+	async setThinkingLevel(level: ThinkingLevel): Promise<void> {
+		const file = await this.loadFile();
+		file.thinkingLevel = level;
+		await this.saveFile(file);
+	}
+
 	async setSearchProfile(profile: SearchProfile): Promise<void> {
 		const file = await this.loadFile();
 		file.searchProfile = profile;
 		await this.saveFile(file);
 	}
 
-	async setSearchApi(url: string, key: string): Promise<void> {
+	async setSearchApi(url: string, key: string, protocol?: SearchApiProtocol): Promise<void> {
 		const file = await this.loadFile();
 		file.apiUrl = url;
 		file.apiKey = key;
+		if (protocol) file.apiProtocol = protocol;
+		await this.saveFile(file);
+	}
+
+	async setSearchApiProtocol(protocol: SearchApiProtocol): Promise<void> {
+		const file = await this.loadFile();
+		file.apiProtocol = protocol;
 		await this.saveFile(file);
 	}
 
@@ -1018,6 +1075,100 @@ function normalizeSearchModel(model: string, apiUrl: string): string {
 	return model;
 }
 
+function parseThinkingLevel(value: unknown): ThinkingLevel | null {
+	if (typeof value !== "string") return null;
+	const normalized = value.trim().toLowerCase();
+	return THINKING_LEVEL_VALUES.includes(normalized as ThinkingLevel)
+		? (normalized as ThinkingLevel)
+		: null;
+}
+
+function normalizeThinkingLevel(value: unknown): ThinkingLevel {
+	return parseThinkingLevel(value) || DEFAULT_THINKING_LEVEL;
+}
+
+function parseSearchApiProtocol(value: unknown): SearchApiProtocol | null {
+	if (typeof value !== "string") return null;
+	const normalized = value.trim().toLowerCase().replace(/[\s_]+/g, "-");
+	// Accept pi-style aliases and short names.
+	if (
+		normalized === "completions"
+		|| normalized === "chat-completions"
+		|| normalized === "openai-completions"
+		|| normalized === "chat/completions"
+	) {
+		return "completions";
+	}
+	if (
+		normalized === "responses"
+		|| normalized === "openai-responses"
+		|| normalized === "response"
+	) {
+		return "responses";
+	}
+	return SEARCH_API_PROTOCOL_VALUES.includes(normalized as SearchApiProtocol)
+		? (normalized as SearchApiProtocol)
+		: null;
+}
+
+function normalizeSearchApiProtocol(value: unknown): SearchApiProtocol {
+	return parseSearchApiProtocol(value) || DEFAULT_SEARCH_API_PROTOCOL;
+}
+
+function formatSearchApiProtocol(protocol: SearchApiProtocol): string {
+	const def = SEARCH_API_PROTOCOL_DEFS[protocol];
+	return `${def.label} (${protocol})`;
+}
+
+function searchApiProtocolMenuItems(current: SearchApiProtocol): string[] {
+	return SEARCH_API_PROTOCOL_VALUES.map((protocol) => {
+		const def = SEARCH_API_PROTOCOL_DEFS[protocol];
+		const prefix = protocol === current ? "✓ " : "  ";
+		return `${prefix}${def.label} (${protocol}) - ${def.description}`;
+	});
+}
+
+function searchApiProtocolFromMenuItem(item: string): SearchApiProtocol | null {
+	const match = item.match(/\((completions|responses)\)/i);
+	if (match?.[1]) return parseSearchApiProtocol(match[1]);
+	const label = item.replace(/^\s*✓?\s*/, "").split(" -")[0]?.trim();
+	for (const protocol of SEARCH_API_PROTOCOL_VALUES) {
+		const def = SEARCH_API_PROTOCOL_DEFS[protocol];
+		if (label === def.label || label === `${def.label} (${protocol})`) return protocol;
+	}
+	return null;
+}
+
+function searchApiEndpoint(apiUrl: string, protocol: SearchApiProtocol): string {
+	const base = apiUrl.replace(/\/+$/, "");
+	const path = SEARCH_API_PROTOCOL_DEFS[protocol].endpoint;
+	// If user already included the terminal path, don't double-append.
+	if (base.endsWith("/chat/completions") || base.endsWith("/responses")) return base;
+	return `${base}${path}`;
+}
+
+function formatThinkingLevel(level: ThinkingLevel): string {
+	return level;
+}
+
+function thinkingLevelMenuItems(current: ThinkingLevel): string[] {
+	return THINKING_LEVEL_VALUES.map((level) => {
+		const prefix = level === current ? "✓ " : "  ";
+		return `${prefix}${level}`;
+	});
+}
+
+function thinkingLevelFromMenuItem(item: string): ThinkingLevel | null {
+	const label = item.replace(/^\s*✓?\s*/, "").trim().toLowerCase();
+	return parseThinkingLevel(label);
+}
+
+/** Map pi thinking levels to OpenAI-compatible reasoning_effort values. */
+function reasoningEffortForThinkingLevel(level: ThinkingLevel): string | undefined {
+	if (level === "off") return undefined;
+	return level;
+}
+
 const STATUS_KEY = "search";
 
 type StatusContext = {
@@ -1027,8 +1178,9 @@ type StatusContext = {
 let nextStatusId = 0;
 const activeStatuses: Array<{ id: number; text: string }> = [];
 
-function formatSearchStatus(model: string): string {
-	return `Search | ${model}`;
+function formatSearchStatus(model: string, thinkingLevel?: ThinkingLevel): string {
+	if (!thinkingLevel || thinkingLevel === "off") return `Search | ${model}`;
+	return `Search | ${model} | think:${thinkingLevel}`;
 }
 
 function beginStatus(ctx: StatusContext, text: string): () => void {
@@ -1200,7 +1352,9 @@ function safeConfigDetails(config: RuntimeConfig): Record<string, unknown> {
 	return {
 		searchApiUrl: config.searchApiUrl,
 		searchApiConfigured: Boolean(config.searchApiUrl && config.searchApiKey),
+		searchApiProtocol: config.searchApiProtocol,
 		searchModel: config.searchModel,
+		thinkingLevel: config.thinkingLevel,
 		searchProfile: config.searchProfile,
 		fallbackMode: config.fallbackMode,
 		minimumProfile: config.minimumProfile,
@@ -2272,9 +2426,112 @@ async function getAvailableModelsCached(
 	}
 }
 
+type ModelSelectUi = {
+	notify(message: string, type?: "info" | "warning" | "error"): void;
+	select(title: string, options: string[]): Promise<string | undefined>;
+	input(prompt: string, initialValue?: string): Promise<string | undefined>;
+};
+
+/** After model is chosen (or already set), prompt for thinking level and persist both. */
+async function promptAndSetThinkingLevel(
+	ui: ModelSelectUi,
+	current: ThinkingLevel,
+	modelLabel: string,
+): Promise<ThinkingLevel | undefined> {
+	const selected = await ui.select(
+		`模型思考等级 (${modelLabel}) 当前: ${current}`,
+		thinkingLevelMenuItems(current),
+	);
+	if (!selected) return undefined;
+	const level = thinkingLevelFromMenuItem(selected);
+	if (!level) return undefined;
+	await configManager.setThinkingLevel(level);
+	return level;
+}
+
+async function selectSearchModelInteractive(ui: ModelSelectUi): Promise<void> {
+	const config = await configManager.getFullConfig();
+	ui.notify("正在获取可用模型...", "info");
+	const models = await getAvailableModelsCached(
+		config.searchApiUrl,
+		config.searchApiKey,
+	);
+
+	let model: string | undefined;
+	if (models.length > 0) {
+		model = await ui.select(`当前: ${config.searchModel}`, models);
+	} else {
+		model = await ui.input("输入模型 ID:", config.searchModel);
+	}
+	if (!model) return;
+
+	await configManager.setModel(model);
+	const level = await promptAndSetThinkingLevel(ui, config.thinkingLevel, model);
+	if (level) {
+		ui.notify(`✅ 模型已切换: ${model} | 思考等级: ${level}`, "info");
+	} else {
+		// Model saved; user cancelled thinking level — keep previous thinking level.
+		ui.notify(`✅ 模型已切换: ${model}（思考等级未改: ${config.thinkingLevel}）`, "info");
+	}
+}
+
 // =============================================================================
 // Search API Client
 // =============================================================================
+
+function buildSearchMessages(
+	query: string,
+	platform: string,
+	profile: SearchProfile,
+	controls: SearchControls,
+): { system: string; user: string } {
+	const timeContext = needsTimeContext(query) ? getLocalTimeInfo() : "";
+	const platformPrompt = platform
+		? `\n\nYou should search the web for the information you need, and focus on these platform: ${platform}\n`
+		: "";
+	return {
+		system: buildSearchPrompt(profile, controls),
+		user: timeContext + query + platformPrompt,
+	};
+}
+
+function buildCompletionsPayload(
+	model: string,
+	system: string,
+	user: string,
+	reasoningEffort?: string,
+): Record<string, unknown> {
+	const payload: Record<string, unknown> = {
+		model,
+		messages: [
+			{ role: "system", content: system },
+			{ role: "user", content: user },
+		],
+		stream: true,
+	};
+	if (reasoningEffort) payload.reasoning_effort = reasoningEffort;
+	return payload;
+}
+
+function buildResponsesPayload(
+	model: string,
+	system: string,
+	user: string,
+	reasoningEffort?: string,
+): Record<string, unknown> {
+	// OpenAI Responses API: instructions + input (not chat messages).
+	const payload: Record<string, unknown> = {
+		model,
+		instructions: system,
+		input: user,
+		stream: true,
+		store: false,
+	};
+	if (reasoningEffort) {
+		payload.reasoning = { effort: reasoningEffort };
+	}
+	return payload;
+}
 
 async function searchWithModel(
 	query: string,
@@ -2283,6 +2540,7 @@ async function searchWithModel(
 	modelOverride = "",
 	controls: SearchControls = resolveSearchControls({}),
 	profile: SearchProfile = "auto",
+	thinkingLevelOverride?: ThinkingLevel,
 ): Promise<string> {
 	const config = await configManager.getFullConfig();
 	if (!config.searchApiUrl || !config.searchApiKey) {
@@ -2292,29 +2550,29 @@ async function searchWithModel(
 		throw new Error("搜索模型未配置。请使用 /search-model 或 /search-config 设置模型 ID。");
 	}
 
-	const timeContext = needsTimeContext(query) ? getLocalTimeInfo() : "";
-	const platformPrompt = platform
-		? `\n\nYou should search the web for the information you need, and focus on these platform: ${platform}\n`
-		: "";
+	const { system, user } = buildSearchMessages(query, platform, profile, controls);
 	const effectiveModel = normalizeSearchModel(modelOverride || config.searchModel, config.searchApiUrl);
+	const thinkingLevel = thinkingLevelOverride ?? config.thinkingLevel;
+	const reasoningEffort = reasoningEffortForThinkingLevel(thinkingLevel);
+	const protocol = config.searchApiProtocol;
+	const endpoint = searchApiEndpoint(config.searchApiUrl, protocol);
+	const payload = protocol === "responses"
+		? buildResponsesPayload(effectiveModel, system, user, reasoningEffort)
+		: buildCompletionsPayload(effectiveModel, system, user, reasoningEffort);
+
 	await debugLog("search.request", {
 		model: effectiveModel,
+		protocol,
+		endpoint,
+		thinkingLevel,
+		reasoningEffort: reasoningEffort || null,
 		platform,
 		profile,
-		hasTimeContext: !!timeContext,
+		hasTimeContext: needsTimeContext(query),
 	});
 
-	const payload = {
-		model: effectiveModel,
-		messages: [
-			{ role: "system", content: buildSearchPrompt(profile, controls) },
-			{ role: "user", content: timeContext + query + platformPrompt },
-		],
-		stream: true,
-	};
-
 	const response = await fetchWithRetry(
-		`${config.searchApiUrl.replace(/\/+$/, "")}/chat/completions`,
+		endpoint,
 		{
 			method: "POST",
 			headers: {
@@ -2326,10 +2584,69 @@ async function searchWithModel(
 		},
 	);
 
-	return parseStreamResponse(response);
+	return parseSearchStreamResponse(response, protocol);
 }
 
-async function parseStreamResponse(response: Response): Promise<string> {
+function extractCompletionsDeltaText(data: Record<string, unknown>): string {
+	const choices = data.choices as Array<{ delta?: { content?: string }; message?: { content?: string } }> | undefined;
+	const choice = choices?.[0];
+	if (!choice) return "";
+	return choice.delta?.content || choice.message?.content || "";
+}
+
+function extractResponsesDeltaText(data: Record<string, unknown>): string {
+	const type = typeof data.type === "string" ? data.type : "";
+	// Streaming Responses events
+	if (type === "response.output_text.delta" && typeof data.delta === "string") {
+		return data.delta;
+	}
+	if (type === "response.refusal.delta" && typeof data.delta === "string") {
+		return data.delta;
+	}
+	if (type === "response.content_part.delta") {
+		const delta = data.delta as { text?: string } | string | undefined;
+		if (typeof delta === "string") return delta;
+		if (delta && typeof delta.text === "string") return delta.text;
+	}
+	// Some proxies emit chat-style deltas even on /responses
+	const choicesText = extractCompletionsDeltaText(data);
+	if (choicesText) return choicesText;
+	return "";
+}
+
+function extractResponsesFinalText(data: Record<string, unknown>): string {
+	if (typeof data.output_text === "string" && data.output_text) return data.output_text;
+
+	const output = data.output as Array<{
+		type?: string;
+		content?: Array<{ type?: string; text?: string; refusal?: string }>;
+		text?: string;
+	}> | undefined;
+	if (!Array.isArray(output)) return "";
+
+	const parts: string[] = [];
+	for (const item of output) {
+		if (typeof item.text === "string" && item.text) parts.push(item.text);
+		if (!Array.isArray(item.content)) continue;
+		for (const part of item.content) {
+			if (part.type === "output_text" && typeof part.text === "string") parts.push(part.text);
+			else if (part.type === "refusal" && typeof part.refusal === "string") parts.push(part.refusal);
+			else if (typeof part.text === "string") parts.push(part.text);
+		}
+	}
+	return parts.join("");
+}
+
+function extractCompletionsFinalText(data: Record<string, unknown>): string {
+	const fromChoice = extractCompletionsDeltaText(data);
+	if (fromChoice) return fromChoice;
+	return "";
+}
+
+async function parseSearchStreamResponse(
+	response: Response,
+	protocol: SearchApiProtocol,
+): Promise<string> {
 	const reader = response.body?.getReader();
 	if (!reader) throw new Error("无法读取响应流");
 
@@ -2355,9 +2672,11 @@ async function parseStreamResponse(response: Response): Promise<string> {
 				if (trimmed === "data: [DONE]" || trimmed === "data:[DONE]") continue;
 
 				try {
-					const data = JSON.parse(trimmed.slice(5).trim());
-					const delta = data.choices?.[0]?.delta;
-					if (delta?.content) content += delta.content;
+					const data = JSON.parse(trimmed.slice(5).trim()) as Record<string, unknown>;
+					const chunk = protocol === "responses"
+						? extractResponsesDeltaText(data)
+						: extractCompletionsDeltaText(data);
+					if (chunk) content += chunk;
 				} catch {
 					// skip malformed chunks
 				}
@@ -2375,11 +2694,10 @@ async function parseStreamResponse(response: Response): Promise<string> {
 		const candidates = [rawLines.join(""), rawLines.join("\n")];
 		for (const candidate of candidates) {
 			try {
-				const data = JSON.parse(candidate) as {
-					choices?: Array<{ message?: { content?: string }; delta?: { content?: string } }>;
-				};
-				const choice = data.choices?.[0];
-				content = choice?.message?.content || choice?.delta?.content || "";
+				const data = JSON.parse(candidate) as Record<string, unknown>;
+				content = protocol === "responses"
+					? extractResponsesFinalText(data) || extractCompletionsFinalText(data)
+					: extractCompletionsFinalText(data) || extractResponsesFinalText(data);
 				if (content) break;
 			} catch {
 				// try next candidate
@@ -3974,14 +4292,21 @@ export default function (pi: ExtensionAPI) {
 					description: "可选模型 ID，仅本次请求生效。留空使用全局配置模型。",
 				}),
 			),
+			thinking_level: Type.Optional(
+				StringEnum(THINKING_LEVEL_VALUES, {
+					description:
+						"可选思考等级，仅本次请求生效。留空使用全局配置（/search-config 或 /search-model 设置）。off 不发送 reasoning_effort。",
+				}),
+			),
 		}),
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const config = await configManager.getFullConfig();
 			const effectiveModel = normalizeSearchModel(params.model || config.searchModel, config.searchApiUrl);
+			const thinkingLevel = parseThinkingLevel(params.thinking_level) || config.thinkingLevel;
 			const profile = parseSearchProfile(params.profile) || config.searchProfile;
 			const controls = resolveSearchControls(params, profile);
-			const endStatus = beginStatus(ctx, formatSearchStatus(effectiveModel));
+			const endStatus = beginStatus(ctx, formatSearchStatus(effectiveModel, thinkingLevel));
 			onUpdate?.({ content: [{ type: "text", text: "🔍 正在搜索..." }], details: {} });
 
 			try {
@@ -4009,7 +4334,15 @@ export default function (pi: ExtensionAPI) {
 						attempts,
 						"main_search",
 						"openai_compatible",
-						() => searchWithModel(params.query, params.platform || "", signal, effectiveModel, controls, profile),
+						() => searchWithModel(
+							params.query,
+							params.platform || "",
+							signal,
+							effectiveModel,
+							controls,
+							profile,
+							thinkingLevel,
+						),
 					),
 				];
 
@@ -4108,6 +4441,8 @@ export default function (pi: ExtensionAPI) {
 						profile,
 						mode: controls.mode,
 						model: effectiveModel,
+						api_protocol: config.searchApiProtocol,
+						thinking_level: thinkingLevel,
 						docs_search_enriched: docsSources.length > 0,
 						routing_decision: {
 							main_search: "openai_compatible",
@@ -4650,7 +4985,7 @@ export default function (pi: ExtensionAPI) {
 					details: { url: params.url, format, error: "invalid_url" },
 				};
 			}
-			const endStatus = beginStatus(ctx, formatSearchStatus(config.searchModel));
+			const endStatus = beginStatus(ctx, formatSearchStatus(config.searchModel, config.thinkingLevel));
 			onUpdate?.({ content: [{ type: "text", text: `📄 正在抓取网页 (${format}/${providerChoice})...` }], details: {} });
 
 			try {
@@ -4787,7 +5122,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const config = await configManager.getFullConfig();
 			const attempts: ProviderAttempt[] = [];
-			const endStatus = beginStatus(ctx, formatSearchStatus(config.searchModel));
+			const endStatus = beginStatus(ctx, formatSearchStatus(config.searchModel, config.thinkingLevel));
 			try {
 				try {
 					const result = await withProviderAttempt(
@@ -4861,7 +5196,9 @@ export default function (pi: ExtensionAPI) {
 					"|--------|-----|",
 					`| Search API URL | ${config.searchApiUrl || "❌ 未配置"} |`,
 					`| Search API Key | ${config.searchApiKey ? configManager.maskKey(config.searchApiKey) : "❌ 未配置"} |`,
+					`| API 协议 | ${formatSearchApiProtocol(config.searchApiProtocol)} |`,
 					`| 搜索模型 | ${config.searchModel || "❌ 未配置"} |`,
+					`| 思考等级 | ${formatThinkingLevel(config.thinkingLevel)} |`,
 					`| 搜索模式 | ${formatSearchProfile(config.searchProfile)} |`,
 					`| Fallback Mode | ${config.fallbackMode} |`,
 					`| Minimum Profile | ${config.minimumProfile} |`,
@@ -5385,11 +5722,11 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const config = await configManager.getFullConfig();
-			const endStatus = beginStatus(ctx, formatSearchStatus(config.searchModel));
+			const endStatus = beginStatus(ctx, formatSearchStatus(config.searchModel, config.thinkingLevel));
 
 			try {
 				const controls = resolveSearchControls({ mode: "compact" }, config.searchProfile);
-				const raw = await searchWithModel(args.trim(), "", undefined, "", controls, config.searchProfile);
+				const raw = await searchWithModel(args.trim(), "", undefined, "", controls, config.searchProfile, config.thinkingLevel);
 				const { answer, sources } = splitAnswerAndSources(raw);
 				const limitedAnswer = limitText(answer, controls.maxAnswerChars);
 
@@ -5442,12 +5779,14 @@ export default function (pi: ExtensionAPI) {
 			const choice = await ctx.ui.select("Pi Search 配置:", [
 				"查看当前配置",
 				"设置 Search API",
+				`切换 API 协议 (${formatSearchApiProtocol(config.searchApiProtocol)})`,
 				"设置 Context7 API",
 				"设置 Context7 Cache TTL",
 				"设置 Exa API",
 				"设置 Tavily API",
 				"设置 Firecrawl API",
 				"切换模型",
+				`切换思考等级 (${config.thinkingLevel})`,
 				`切换搜索模式 (${SEARCH_PROFILE_DEFS[config.searchProfile].label})`,
 				`切换 Fallback Mode (${config.fallbackMode})`,
 				`切换 Minimum Profile (${config.minimumProfile})`,
@@ -5455,6 +5794,33 @@ export default function (pi: ExtensionAPI) {
 			]);
 
 			if (!choice) return;
+
+			if (choice.startsWith("切换 API 协议")) {
+				const config = await configManager.getFullConfig();
+				const selected = await ctx.ui.select(
+					"Search API 协议:",
+					searchApiProtocolMenuItems(config.searchApiProtocol),
+				);
+				if (!selected) return;
+				const protocol = searchApiProtocolFromMenuItem(selected);
+				if (!protocol) return;
+				await configManager.setSearchApiProtocol(protocol);
+				ctx.ui.notify(`✅ API 协议已切换: ${formatSearchApiProtocol(protocol)}`, "info");
+				return;
+			}
+
+			if (choice.startsWith("切换思考等级")) {
+				const config = await configManager.getFullConfig();
+				const level = await promptAndSetThinkingLevel(
+					ctx.ui,
+					config.thinkingLevel,
+					config.searchModel || "未配置模型",
+				);
+				if (level) {
+					ctx.ui.notify(`✅ 思考等级已切换: ${level}`, "info");
+				}
+				return;
+			}
 
 			if (choice.startsWith("切换搜索模式")) {
 				const config = await configManager.getFullConfig();
@@ -5491,7 +5857,9 @@ export default function (pi: ExtensionAPI) {
 					const config = await configManager.getFullConfig();
 					const lines = [
 						`Search API: ${config.searchApiUrl || "未配置"} | ${config.searchApiKey ? configManager.maskKey(config.searchApiKey) : "未配置"}`,
+						`API 协议: ${formatSearchApiProtocol(config.searchApiProtocol)} → ${searchApiEndpoint(config.searchApiUrl || DEFAULT_SEARCH_API_URL, config.searchApiProtocol)}`,
 						`模型: ${config.searchModel}`,
+						`思考等级: ${formatThinkingLevel(config.thinkingLevel)}`,
 						`搜索模式: ${formatSearchProfile(config.searchProfile)}`,
 						`Fallback Mode: ${config.fallbackMode}`,
 						`Minimum Profile: ${config.minimumProfile}`,
@@ -5506,15 +5874,23 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				case "设置 Search API": {
+					const current = await configManager.getFullConfig();
 					const url = await ctx.ui.input(
 						"Search API URL:",
-						DEFAULT_SEARCH_API_URL,
+						current.searchApiUrl || DEFAULT_SEARCH_API_URL,
 					);
 					if (!url) return;
 					const key = await ctx.ui.input("Search API Key:", "");
 					if (!key) return;
-					await configManager.setSearchApi(url, key);
-					ctx.ui.notify(`✅ Search API 已配置`, "info");
+					const protocolItem = await ctx.ui.select(
+						"Search API 协议:",
+						searchApiProtocolMenuItems(current.searchApiProtocol),
+					);
+					const protocol = protocolItem
+						? searchApiProtocolFromMenuItem(protocolItem) || current.searchApiProtocol
+						: current.searchApiProtocol;
+					await configManager.setSearchApi(url, key, protocol);
+					ctx.ui.notify(`✅ Search API 已配置 | 协议: ${formatSearchApiProtocol(protocol)}`, "info");
 					break;
 				}
 
@@ -5565,29 +5941,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				case "切换模型": {
-					const config = await configManager.getFullConfig();
-					ctx.ui.notify("正在获取可用模型...", "info");
-					const models = await getAvailableModelsCached(
-						config.searchApiUrl,
-						config.searchApiKey,
-					);
-
-					if (models.length > 0) {
-						const choice = await ctx.ui.select(
-							`当前: ${config.searchModel}`,
-							models,
-						);
-						if (choice) {
-							await configManager.setModel(choice);
-							ctx.ui.notify(`✅ 模型已切换: ${choice}`, "info");
-						}
-					} else {
-						const model = await ctx.ui.input("输入模型 ID:", config.searchModel);
-						if (model) {
-							await configManager.setModel(model);
-							ctx.ui.notify(`✅ 模型已切换: ${model}`, "info");
-						}
-					}
+					await selectSearchModelInteractive(ctx.ui);
 					break;
 				}
 
@@ -5660,34 +6014,35 @@ export default function (pi: ExtensionAPI) {
 	// Command: /search-model
 	// =========================================================================
 	pi.registerCommand("search-model", {
-		description: "快速切换搜索模型（/search-model [model-id]）",
+		description: "快速切换搜索模型与思考等级（/search-model [model-id] [thinking-level]）",
 		handler: async (args, ctx) => {
-			if (args.trim()) {
-				await configManager.setModel(args.trim());
-				ctx.ui.notify(`✅ 模型已切换: ${args.trim()}`, "info");
+			const parts = args.trim().split(/\s+/).filter(Boolean);
+			if (parts.length > 0) {
+				const modelArg = parts[0]!;
+				const levelArg = parts[1] ? parseThinkingLevel(parts[1]) : null;
+				await configManager.setModel(modelArg);
+				if (levelArg) {
+					await configManager.setThinkingLevel(levelArg);
+					ctx.ui.notify(`✅ 模型已切换: ${modelArg} | 思考等级: ${levelArg}`, "info");
+					return;
+				}
+				if (parts[1]) {
+					ctx.ui.notify(
+						`⚠️ 无效思考等级: ${parts[1]}（可用: ${THINKING_LEVEL_VALUES.join(", ")}）`,
+						"warning",
+					);
+				}
+				const config = await configManager.getFullConfig();
+				const level = await promptAndSetThinkingLevel(ctx.ui, config.thinkingLevel, modelArg);
+				if (level) {
+					ctx.ui.notify(`✅ 模型已切换: ${modelArg} | 思考等级: ${level}`, "info");
+				} else {
+					ctx.ui.notify(`✅ 模型已切换: ${modelArg}（思考等级未改: ${config.thinkingLevel}）`, "info");
+				}
 				return;
 			}
 
-			const config = await configManager.getFullConfig();
-			ctx.ui.notify("正在获取可用模型...", "info");
-			const models = await getAvailableModelsCached(
-				config.searchApiUrl,
-				config.searchApiKey,
-			);
-
-			if (models.length > 0) {
-				const choice = await ctx.ui.select(`当前: ${config.searchModel}`, models);
-				if (choice) {
-					await configManager.setModel(choice);
-					ctx.ui.notify(`✅ 模型已切换: ${choice}`, "info");
-				}
-			} else {
-				const model = await ctx.ui.input("输入模型 ID:", config.searchModel);
-				if (model) {
-					await configManager.setModel(model);
-					ctx.ui.notify(`✅ 模型已切换: ${model}`, "info");
-				}
-			}
+			await selectSearchModelInteractive(ctx.ui);
 		},
 	});
 
@@ -5700,7 +6055,7 @@ export default function (pi: ExtensionAPI) {
 			const topic =
 				args.trim() || "pi Extension API registerTool registerCommand";
 			const config = await configManager.getFullConfig();
-			const endStatus = beginStatus(ctx, formatSearchStatus(config.searchModel));
+			const endStatus = beginStatus(ctx, formatSearchStatus(config.searchModel, config.thinkingLevel));
 
 			try {
 				const profile: SearchProfile = "coding_docs";
@@ -5712,6 +6067,7 @@ export default function (pi: ExtensionAPI) {
 					"",
 					controls,
 					profile,
+					config.thinkingLevel,
 				);
 				const { answer, sources } = splitAnswerAndSources(raw);
 				const limitedAnswer = limitText(answer, controls.maxAnswerChars);
