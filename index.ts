@@ -1429,8 +1429,6 @@ const DIRECT_FETCH_MIN_INPUT_BYTES = 256 * 1024;
 const DIRECT_FETCH_MAX_INPUT_BYTES = 2 * 1024 * 1024;
 const DIRECT_FETCH_LARGE_BODY_BYTES = 5 * 1024 * 1024;
 const SEARCH_MODE_VALUES: SearchMode[] = ["compact", "normal", "deep", "sources_only"];
-const WEB_FETCH_LIGHT_PROMPT =
-	"web_fetch can be used independently when the user gives a concrete HTTP(S) URL, and it also remains the follow-up inspection tool for selected search sources. Prefer markdown previews; use html/raw/json only for source/API/debug needs.";
 const SEARCH_MODE_DEFAULTS: Record<SearchMode, Omit<SearchControls, "mode">> = {
 	compact: { maxAnswerChars: 6000, maxSources: 8, maxOutputBytes: 12 * 1024 },
 	normal: { maxAnswerChars: 12000, maxSources: 12, maxOutputBytes: 20 * 1024 },
@@ -1452,15 +1450,10 @@ const SEARCH_PROFILE_DEFS: Record<SearchProfile, SearchProfileDefinition> = {
 	auto: {
 		label: "自动",
 		description: "根据问题自动选择搜索策略",
-		lightPrompt:
-			"Current search profile: auto. Let search infer the source strategy, keep results compact, and avoid long page fetches unless needed.",
+		lightPrompt: "",
 		searchPrompt: `# Search Profile: Auto
 
-Infer the best search strategy from the query.
-If it is about programming, prefer official docs and GitHub.
-If it is about academic or research material, prioritize papers, reports, and multi-source evidence.
-If it is about factual claims, verify with independent sources.
-Keep the result compact unless the query explicitly asks for depth.`,
+Choose sources from the query: official documentation and repositories for programming, papers and reports for research, and independent evidence for factual claims. Use deeper coverage only when requested.`,
 		defaults: SEARCH_MODE_DEFAULTS,
 	},
 	coding_docs: {
@@ -1470,27 +1463,11 @@ Keep the result compact unless the query explicitly asks for depth.`,
 			"Current search profile: coding_docs. Prefer official docs, versioned API references, and compact source-first results.",
 		searchPrompt: `# Search Profile: Coding Docs
 
-Goal:
-Find precise technical documentation for programming tasks.
+Find precise technical documentation.
 
-Source priority:
-1. Official documentation
-2. Versioned API reference
-3. Official examples
-4. GitHub README, release notes, or changelog
-5. High-quality community articles only as fallback
+Source priority: official documentation, versioned API references, official examples, then repository README, release notes, or changelog; use community material only as fallback.
 
-Output:
-- Direct answer first
-- API names, function signatures, config keys, and version notes when relevant
-- Minimal example if useful
-- Mention whether the source is official
-- Return only the most relevant links
-
-Avoid:
-- Long background explanations
-- Blog-first answers when official docs exist
-- Unverified snippets`,
+Include relevant API names, signatures, configuration keys, version notes, official status, and a minimal verified example when useful. Avoid unverified snippets and blog-first answers.`,
 		defaults: {
 			compact: { maxAnswerChars: 3500, maxSources: 6, maxOutputBytes: 9000 },
 			normal: { maxAnswerChars: 7000, maxSources: 10, maxOutputBytes: 14 * 1024 },
@@ -1505,26 +1482,9 @@ Avoid:
 			"Current search profile: code_examples. Prefer official examples and real repository file links; avoid large code dumps.",
 		searchPrompt: `# Search Profile: Code Examples
 
-Goal:
-Find real-world code examples or official sample implementations.
+Find real implementations from official example repositories, framework or library repositories, and established open-source projects; use gists or articles only as fallback.
 
-Source priority:
-1. Official example repositories
-2. Framework or library GitHub repos
-3. Well-known open-source projects
-4. Gists or blogs only as fallback
-
-Output:
-- Repository name
-- File path or direct URL when possible
-- Short reason why the example is relevant
-- Small snippet or usage summary
-- License caution if the user may copy code
-
-Avoid:
-- Large code dumps
-- Toy examples unless official
-- Sources without clear file paths`,
+Give the repository, direct file path or URL when available, why it is relevant, and only the necessary snippet or usage summary. Mention license constraints when code may be copied. Avoid large dumps, untraceable examples, and unofficial toy code when official examples exist.`,
 		defaults: {
 			compact: { maxAnswerChars: 4000, maxSources: 8, maxOutputBytes: 10000 },
 			normal: { maxAnswerChars: 8000, maxSources: 12, maxOutputBytes: 16 * 1024 },
@@ -1539,25 +1499,9 @@ Avoid:
 			"Current search profile: project_research. Prefer official sites, README, changelog, release notes, and maintenance signals.",
 		searchPrompt: `# Search Profile: Project Research
 
-Goal:
-Research a project, library, framework, tool, or ecosystem.
+Research a project, library, framework, tool, or ecosystem using its official site or docs, repository README, releases or changelog, issues or discussions, then reputable comparisons.
 
-Source priority:
-1. Official website or docs
-2. GitHub README
-3. Release notes or changelog
-4. Issues or discussions
-5. Reputable comparisons or articles
-
-Output:
-- What it is
-- Current state and maintenance signal
-- Strengths and limitations
-- Relevant links
-- Mention stale or uncertain information
-
-Avoid:
-- Overclaiming popularity or stability without evidence`,
+Explain what it is, current maintenance signals, strengths, limitations, and relevant links. Mark stale or uncertain information and do not infer popularity or stability without evidence.`,
 		defaults: {
 			compact: { maxAnswerChars: 6000, maxSources: 10, maxOutputBytes: 12 * 1024 },
 			normal: { maxAnswerChars: 12000, maxSources: 16, maxOutputBytes: 20 * 1024 },
@@ -1572,28 +1516,9 @@ Avoid:
 			"Current search profile: academic. Prefer citeable papers, reports, DOI/stable URLs, and multi-source evidence.",
 		searchPrompt: `# Search Profile: Academic Research
 
-Goal:
-Find accurate, citeable research material.
+Prioritize peer-reviewed papers, academic databases, official reports or white papers, books, and institutional publications; use secondary sources only for context.
 
-Source priority:
-1. Peer-reviewed papers
-2. Academic databases
-3. Official reports or white papers
-4. Books or institutional publications
-5. Reputable secondary sources only as context
-
-Output:
-- Author, year, title, and venue if available
-- DOI or stable URL if available
-- Main claim, method, and evidence
-- Limitations
-- Conflicting findings if present
-- Separate confirmed facts from uncertain claims
-
-Avoid:
-- Single-source conclusions
-- Blog-style summaries as primary evidence
-- Missing citation metadata when available`,
+Include available authors, year, title, venue, DOI or stable URL, main claim, method, evidence, limitations, and conflicting findings. Separate confirmed findings from uncertain claims and avoid single-source conclusions.`,
 		defaults: {
 			compact: { maxAnswerChars: 12000, maxSources: 20, maxOutputBytes: 24 * 1024 },
 			normal: { maxAnswerChars: 18000, maxSources: 30, maxOutputBytes: 32 * 1024 },
@@ -1608,26 +1533,9 @@ Avoid:
 			"Current search profile: fact_check. Verify claims with independent timely sources and surface conflicts or uncertainty.",
 		searchPrompt: `# Search Profile: Fact Check
 
-Goal:
-Verify factual claims using independent and timely sources.
+Verify claims with primary sources, official announcements or public records, reputable media, and independent expert analysis; use encyclopedic summaries only as background.
 
-Source priority:
-1. Primary sources
-2. Official announcements or public records
-3. Reputable media
-4. Independent expert analysis
-5. Wikipedia only as background, not primary proof
-
-Output:
-- Verdict first: likely true, likely false, mixed, or unresolved
-- Evidence for and against
-- Source freshness
-- Known uncertainty
-- Confidence level
-
-Avoid:
-- Treating repeated syndicated reports as independent sources
-- Hiding conflicting evidence`,
+Lead with likely true, likely false, mixed, or unresolved. Present supporting and conflicting evidence, source freshness, uncertainty, and confidence. Do not treat syndicated copies as independent sources or hide conflicting evidence.`,
 		defaults: {
 			compact: { maxAnswerChars: 7000, maxSources: 12, maxOutputBytes: 16 * 1024 },
 			normal: { maxAnswerChars: 12000, maxSources: 18, maxOutputBytes: 24 * 1024 },
@@ -4152,20 +4060,12 @@ const searchToolsParameters = Type.Object({
 	}),
 });
 
-const SEARCH_PROMPT_BASE = `# Core Instruction
+const SEARCH_PROMPT_BASE = `Answer the query with evidence from suitable web sources.
 
-1. Infer the user's intent from the query, but do not broaden the task unless necessary.
-2. Verify factual claims with authoritative sources before answering.
-3. Prefer official documentation, academic databases, reputable media, and primary sources.
-4. Cite sources at paragraph or table-row level. Do not cite every sentence.
-5. Be concise and stay within the output budget.
-
-# Output Style
-
-1. Lead with the most probable answer or solution.
-2. Use polished Markdown.
-3. Define technical terms only when they are necessary for understanding.
-4. State limitations when evidence is incomplete or conflicting.
+- Preserve the requested scope and lead with the answer.
+- Prefer primary and authoritative sources; distinguish facts, inference, and uncertainty.
+- Cite evidence at paragraph or table-row level without citing every sentence.
+- Use concise Markdown, define only necessary terms, and respect the output budget.
 `;
 
 function buildSearchPrompt(profile: SearchProfile, controls: SearchControls): string {
@@ -4211,9 +4111,9 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (_event, _ctx) => {
 		const config = await configManager.getFullConfig();
-		return {
-			systemPrompt: `${_event.systemPrompt}\n\n${SEARCH_PROFILE_DEFS[config.searchProfile].lightPrompt}\n${WEB_FETCH_LIGHT_PROMPT}\nAdditional Pi Search capabilities are deferred. Use search_tools only when granular Context7 access, cached source paging, site mapping, deep-research planning, or diagnostics are actually needed.`,
-		};
+		const profilePrompt = SEARCH_PROFILE_DEFS[config.searchProfile].lightPrompt;
+		if (!profilePrompt) return;
+		return { systemPrompt: `${_event.systemPrompt}\n\n${profilePrompt}` };
 	});
 
 	// =========================================================================
@@ -4223,15 +4123,12 @@ export default function (pi: ExtensionAPI) {
 		name: "search_tools",
 		renderResult: renderPiSearchResult,
 		label: "Search Tools",
-		description:
-			"按需激活额外 Pi Search 工具组，减少普通轮次的工具定义和选择噪音。" +
-			"基础 search、docs_search、web_fetch 始终可用；仅在确有需要时激活 Context7 细分工具、缓存信源分页、站点映射、离线规划或诊断。",
-		promptSnippet: "按需激活额外搜索能力，避免默认暴露全部工具",
+		description: "Activate optional Pi Search capability groups for the current session: granular Context7 access, cached source paging, website mapping, research planning, or provider diagnostics. Core search, documentation search, and URL fetching remain available without activation.",
+		promptSnippet: "Activate optional Pi Search capability groups for the current session.",
 		promptGuidelines: [
-			"Use search_tools only when the active search, docs_search, and web_fetch tools cannot complete the task.",
-			"Activate planning only for explicit deep research, multi-source verification, or complex comparison requests.",
-			"Activate diagnostics only when the user asks about provider configuration or connectivity.",
-			"Tool activation is incremental for the current session; do not activate every group preemptively.",
+			"Use search_tools only when an optional capability group is required for the task.",
+			"Activate planning only for explicit deep research, multi-source verification, or complex comparison; activate diagnostics only for requested configuration or connectivity checks.",
+			"Request only the required groups; activation is cumulative for the current session.",
 		],
 		parameters: searchToolsParameters,
 		async execute(_toolCallId, params) {
@@ -4262,18 +4159,12 @@ export default function (pi: ExtensionAPI) {
 		name: "search",
 		renderResult: renderPiSearchResult,
 		label: "Pi Search",
-		description:
-			"通过 OpenAI-compatible Search API 执行 AI 驱动的深度网络搜索。自动检测时间相关查询并注入时间上下文。\n" +
-			"返回受预算控制的搜索结果正文和 session_id（用于 search_sources 获取信源）。\n" +
-			"默认 compact 模式，适用：查找技术文档、API 规范、开源项目、pi Extension 开发指南等。",
-		promptSnippet:
-			"通过 OpenAI-compatible Search API 执行 AI 深度网络搜索（文档、API、开源项目等）",
+		description: "Search the web through an OpenAI-compatible Search API and synthesize an evidence-based answer. It supports time-sensitive queries, source-focused platform filters, research profiles, bounded output modes, optional supplemental providers, and returns a session_id when sources are available.",
+		promptSnippet: "Search the web and synthesize a source-backed answer for external, current, or research questions.",
 		promptGuidelines: [
-			"Use search when external, recent, or authoritative web information is needed.",
-			"Search queries to search should be in English when possible; answer the user in Chinese unless requested otherwise.",
-			"Prefer the active search profile; pass profile explicitly only when the user asks for a different search style.",
-			"For programming tasks, prefer official docs and GitHub sources; use web_fetch only for selected high-value pages.",
-			"Avoid injecting long web pages into context; prefer compact results, source lists, and targeted fetches.",
+			"Use search when the task needs web evidence, current information, comparison, verification, or synthesis across sources.",
+			"Write a clear, self-contained query; use platform only when results should focus on named sites or communities.",
+			"Use the configured profile and compact mode unless the user requests another research style or depth; keep retrieval bounded and inspect source pages before relying on page-specific details.",
 		],
 		parameters: Type.Object({
 			query: Type.String({
@@ -4974,20 +4865,12 @@ export default function (pi: ExtensionAPI) {
 		name: "web_fetch",
 		renderResult: renderPiSearchResult,
 		label: "Web Fetch",
-		description:
-			"独立抓取一个明确的 HTTP/HTTPS URL，并返回受输出预算保护的页面/API 预览。\n" +
-			"默认 format=markdown；markdown/text 优先使用 Tavily Extract，markdown/html/raw 可降级到 Firecrawl Scrape，再用 smart_direct（wreq-js TLS 指纹 + Defuddle 可读正文提取），最后使用 direct fetch。\n" +
-			"可独立用于用户给定 URL，也可作为 search 后检查选中信源的后续工具；不执行 JavaScript，不处理登录会话，也不是批量下载器。",
-		promptSnippet: "独立抓取指定 URL 预览；也可检查 search 选中信源",
+		description: "Fetch one explicit HTTP(S) URL and return a bounded page or API preview. It supports markdown, text, HTML, JSON, and raw output; may fall back through configured extraction providers; exposes response metadata; and does not execute JavaScript, use login sessions, bypass access controls, or perform bulk downloads.",
+		promptSnippet: "Fetch and inspect one explicit web page or API URL with bounded output and response metadata.",
 		promptGuidelines: [
-			"Use web_fetch directly when the user provides a concrete HTTP(S) URL and asks to read, inspect, summarize, verify, or debug that page/API response.",
-			"Keep the existing search flow: when the URL is unknown, use search first, then web_fetch only for selected high-value source URLs that need inspection.",
-			"Default to format=markdown for readable page previews. Use format=text for plain text, html for cleaned/source HTML inspection, json for API payloads or structured metadata, and raw only for bounded raw-body/rawHtml debugging.",
-			"Use returned details.metadata for status, final URL, content type, content length, title, description, canonical URL, and binary/large-file decisions.",
-			"Do not treat web_fetch as a browser, JavaScript renderer, login/session tool, bulk downloader, or anti-bot bypass; large/binary targets should be summarized by metadata instead of injected.",
-			"Respect the context budget: fetch one URL at a time, avoid raw/html unless needed, and increase max_output_bytes only when the user explicitly needs more content.",
-			"Use provider=smart_direct for HTML pages where normal direct fetch is noisy or blocked; it uses browser-grade TLS/HTTP fingerprinting plus Defuddle extraction but still does not execute JavaScript.",
-			"If extraction is thin, truncated, blocked, or mismatched, report that limitation and switch back to search or a narrower URL instead of repeatedly fetching broad pages.",
+			"Use web_fetch when a concrete URL must be read, summarized, verified, or debugged; fetch one URL at a time and inspect only selected pages.",
+			"Use markdown by default, text for plain content, HTML for markup inspection, JSON for structured payloads, and raw only for bounded body-level debugging.",
+			"Use metadata to judge redirects, content type, size, and extraction quality. If content is blocked, truncated, thin, or mismatched, report the limitation and change source or URL rather than repeatedly fetching the same broad page.",
 		],
 		parameters: Type.Object({
 			url: Type.String({ description: "要抓取的网页 URL（HTTP/HTTPS）" }),
