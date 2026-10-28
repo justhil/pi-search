@@ -4213,6 +4213,12 @@ export default function (pi: ExtensionAPI) {
 			"Write a clear, self-contained query; use platform only when results should focus on named sites or communities.",
 			"Use the configured profile and compact mode unless the user requests another research style or depth; keep retrieval bounded and inspect source pages before relying on page-specific details.",
 		],
+		...{ outputSchema: Type.Object({
+			backend: Type.String(),
+			text: Type.String(),
+			session_id: Type.String(),
+			sources: Type.Array(Type.Object({ url: Type.String(), title: Type.Optional(Type.String()), description: Type.Optional(Type.String()), provider: Type.Optional(Type.String()) })),
+		}) },
 		parameters: Type.Object({
 			query: Type.String({
 				description: "搜索查询，清晰、自包含的自然语言问题",
@@ -4310,10 +4316,16 @@ export default function (pi: ExtensionAPI) {
 					if (!sources.length && !config.exaApiKeys.length && !config.tavilyApiKeys.length) throw new Error("请配置 Exa 或 Tavily API Key。");
 					sourcesCache.set(sessionId, sources);
 					if (sources.length) activateSearchTools(["search_sources"]);
-					const visible = limitSources(sources, controls.maxSources);
+					const visible = limitSources(sources, controls.maxSources).map((source) => ({
+						...source,
+						...(source.description ? { description: (() => {
+							const preview = limitText(source.description.replace(/\s+/g, " ").trim(), 199);
+							return preview.text + (preview.truncated ? "…" : "");
+						})() } : {}),
+					}));
 					const output = visible.length ? `搜索结果（候选信源，重要结论请抓取网页核实） | session_id: ${sessionId}\n\n${visible.map((s) => `- [${s.title || s.url}](${s.url})${s.description ? `\n  ${s.description}` : ""}`).join("\n")}` : "没有找到搜索结果。";
 					const rendered = await truncateToolOutput(output, "search", { maxBytes: controls.maxOutputBytes });
-					return { content: [{ type: "text", text: rendered.content }], details: { session_id: sessionId, backend: "providers", sources_count: sources.length, ...capabilityDiagnostics(config, attempts) } };
+					return { content: [{ type: "text", text: rendered.content }], structuredContent: { backend: "providers", text: rendered.content, session_id: sessionId, sources: visible }, details: { session_id: sessionId, backend: "providers", sources_count: sources.length, ...capabilityDiagnostics(config, attempts) } };
 				}
 
 				// Parallel: Search Model search + optional Tavily/Firecrawl
@@ -4429,6 +4441,7 @@ export default function (pi: ExtensionAPI) {
 				const { content, ...outputDetails } = finalOutput;
 				return {
 					content: [{ type: "text", text: content }],
+					structuredContent: { backend: "model", text: content, session_id: sessionId, sources: visibleSources.map(({ url, title, provider }) => ({ url, title, provider })) },
 					details: {
 						session_id: sessionId,
 						sources_count: allSources.length,
@@ -4472,6 +4485,7 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 	pi.registerTool({
 		name: "context7_resolve_library_id",
+		...{ exposure: "deferred" as const },
 		renderResult: renderPiSearchResult,
 		label: "Context7 Resolve Library ID",
 		description:
@@ -4555,6 +4569,7 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 	pi.registerTool({
 		name: "context7_query_docs",
+		...{ exposure: "deferred" as const },
 		renderResult: renderPiSearchResult,
 		label: "Context7 Query Docs",
 		description:
@@ -4616,6 +4631,7 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 	pi.registerTool({
 		name: "context7_get_library_docs",
+		...{ exposure: "deferred" as const },
 		renderResult: renderPiSearchResult,
 		label: "Context7 Get Library Docs",
 		description:
@@ -4706,6 +4722,7 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 	pi.registerTool({
 		name: "context7_get_cached_doc_raw",
+		...{ exposure: "deferred" as const },
 		renderResult: renderPiSearchResult,
 		label: "Context7 Cached Doc Raw",
 		description:
@@ -4852,6 +4869,7 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 	pi.registerTool({
 		name: "search_sources",
+		...{ exposure: "deferred" as const },
 		renderResult: renderPiSearchResult,
 		label: "Search Sources",
 		description:
@@ -4958,7 +4976,7 @@ export default function (pi: ExtensionAPI) {
 				}),
 			),
 			max_output_bytes: Type.Optional(
-				Type.Number({ description: "返回内容最大字节数，默认 12000；长输出会自动折叠并保存完整文件", minimum: 3000, maximum: 51200 }),
+				Type.Number({ description: "返回内容最大字节数，默认 6000；长输出会自动折叠并保存完整文件", minimum: 3000, maximum: 51200 }),
 			),
 			maxChars: Type.Optional(Type.Number({ description: "smart_direct 提取后最大字符数，默认 50000", minimum: 1000, maximum: 200000 })),
 			timeout_ms: Type.Optional(Type.Number({ description: "smart_direct 请求超时毫秒，默认 15000", minimum: 1000, maximum: 120000 })),
@@ -4973,7 +4991,7 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const config = await configManager.getFullConfig();
-			const maxOutputBytes = clampNumber(params.max_output_bytes, 12000, 3000, 50 * 1024);
+			const maxOutputBytes = clampNumber(params.max_output_bytes, 6000, 3000, 50 * 1024);
 			const format = normalizeWebFetchFormat(params.format);
 			const providerChoice = normalizeWebFetchProviderChoice(params.provider);
 			const smartOptions = resolveSmartDirectOptions(params as Record<string, unknown>);
@@ -5091,6 +5109,7 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 	pi.registerTool({
 		name: "web_map",
+		...{ exposure: "deferred" as const },
 		renderResult: renderPiSearchResult,
 		label: "Web Map",
 		description:
@@ -5183,6 +5202,7 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 	pi.registerTool<typeof searchConfigParameters, Record<string, unknown>>({
 		name: "search_config",
+		...{ exposure: "deferred" as const },
 		renderResult: renderPiSearchResult,
 		label: "Search Config",
 		description:
@@ -5348,6 +5368,7 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 	pi.registerTool<typeof searchPlanningParameters, Record<string, unknown>>({
 		name: "search_planning",
+		...{ exposure: "deferred" as const },
 		renderResult: renderPiSearchResult,
 		label: "Search Planning",
 		description:

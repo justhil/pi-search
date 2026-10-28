@@ -310,11 +310,12 @@ Context7 缓存行为：
 
 为避免一次搜索把上下文撑爆，默认启用保守预算：
 
-- `search` 默认 `mode=compact`，只返回紧凑答案和 Top 信源；明确需要深度研究时再用 `mode=deep`
+- `search` 默认 `mode=compact`，只返回紧凑答案和 Top 信源；引擎模式每条摘要最多约 200 字符；`search_sources` 可分页查看缓存信源；明确需要深度研究时再用 `mode=deep`
+- 新版 pi 的 `codemode` 可直接获取 `search` 的结构化结果并筛选来源；低频工具也支持通过原生 `tool_search` 发现，原有 `search_tools` 仍可使用
 - `extra_sources` 是 Tavily/Firecrawl 共享的补充信源总预算，不会再被两个引擎叠加放大
 - `search_sources` 支持 `limit` / `offset` 分页，默认每次 20 条
 - `search` 在 `coding_docs/code_examples/project_research` 或 docs/API/GitHub 查询中会自动尝试 docs source enrichment
-- `web_fetch` 默认 `format=markdown`，长输出自动折叠并保存完整文件；即使未配置 Tavily/Firecrawl 也会尝试 `smart_direct` / `direct`，可用 `provider` / `format` / `max_output_bytes` 临时调整
+- `web_fetch` 默认 `format=markdown`、输出预算 6000 字节，长输出自动折叠并保存完整文件；即使未配置 Tavily/Firecrawl 也会尝试 `smart_direct` / `direct`，可用 `provider` / `format` / `max_output_bytes` 临时调整
 - `web_map` 默认 `max_breadth=10`、`limit=30`，并走统一输出截断
 
 常用参数：

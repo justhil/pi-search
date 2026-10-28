@@ -195,6 +195,22 @@ afterEach(() => {
 });
 
 describe("pi-search extension", () => {
+	it("keeps later search results visible when the first summary is long", async () => {
+		process.env.SEARCH_BACKEND = "providers";
+		process.env.EXA_API_KEY = "test-exa-key";
+		globalThis.fetch = vi.fn(async () => jsonResponse({ results: [
+			{ title: "First", url: "https://example.com/first", highlights: ["长".repeat(10000)] },
+			{ title: "Second", url: "https://example.com/second", highlights: ["Useful evidence"] },
+		] })) as typeof fetch;
+		const result = await runTool(installExtension(), "search", { query: "example" });
+		expect(result.content[0].text).toContain("Second");
+		expect(result.content[0].text).toContain("Useful evidence");
+		expect(result.content[0].text.length).toBeLessThan(2000);
+		const structured = (result as unknown as { structuredContent: { sources: Array<{ title: string; description: string }> } }).structuredContent;
+		expect(structured.sources.map((source) => source.title)).toEqual(["First", "Second"]);
+		expect(structured.sources[0].description.length).toBeLessThanOrEqual(200);
+	});
+
 	it("rotates Exa keys and skips a rate-limited key", async () => {
 		process.env.SEARCH_BACKEND = "providers";
 		const path = process.env.PI_SEARCH_CONFIG_PATH!;
@@ -261,6 +277,8 @@ describe("pi-search extension", () => {
 	it("registers the enhanced search tools without legacy planning tools by default", () => {
 		const pi = installExtension();
 
+		expect((pi.tools.get("search_sources") as unknown as { exposure: string }).exposure).toBe("deferred");
+		expect((pi.tools.get("web_map") as unknown as { exposure: string }).exposure).toBe("deferred");
 		expect([...pi.tools.keys()]).toEqual(expect.arrayContaining([
 			"search_tools",
 			"search",
@@ -651,6 +669,17 @@ describe("pi-search extension", () => {
 			redirect: "follow",
 			timeout: 15000,
 		}));
+	});
+
+	it("bounds the default web_fetch preview while preserving full content", async () => {
+		const longText = Array.from({ length: 150 }, (_, index) => `line-${index} ${"x".repeat(80)}`).join("\n");
+		globalThis.fetch = vi.fn(async () => textResponse(longText)) as typeof fetch;
+		const result = await runTool(installExtension(), "web_fetch", {
+			url: "https://example.com/long.txt", format: "text", provider: "direct",
+		});
+		expect(result.content[0]?.text).toContain("Full output saved to:");
+		expect(Buffer.byteLength(result.content[0].text)).toBeLessThan(6500);
+		expect(typeof result.details?.fullOutputPath).toBe("string");
 	});
 
 	it("auto-folds long web_fetch output and saves the full content", async () => {

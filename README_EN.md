@@ -175,10 +175,11 @@ The main pi prompt only receives a lightweight hint for the active profile. Full
 
 To avoid context blow-ups, conservative budgets are enabled by default:
 
-- `search` defaults to `mode=compact`; use `mode=deep` only for explicit deep-research requests
+- `search` defaults to `mode=compact`; provider-mode summaries are limited to about 200 characters per source. Use `search_sources` for cached sources, and `mode=deep` for explicit deep-research requests
+- Recent pi versions expose structured `search` results to `codemode` for filtering and let `tool_search` discover optional tools; `search_tools` remains available
 - `extra_sources` is a shared Tavily/Firecrawl source budget, not a per-provider multiplier
 - `search_sources` supports `limit` / `offset` pagination and defaults to 20 sources per call
-- `web_fetch` defaults to `format=markdown` and returns an approximately 12KB preview; it still tries direct fetch without Tavily/Firecrawl, and `format` / `max_output_bytes` can adjust one call
+- `web_fetch` defaults to `format=markdown` and uses a default output budget of 6000 bytes; it still tries direct fetch without Tavily/Firecrawl, and `format` / `max_output_bytes` can adjust one call
 - `web_map` defaults to `max_breadth=10`, `limit=30`, and uses the shared output truncation path
 
 Common parameters:
