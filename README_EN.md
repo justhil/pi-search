@@ -4,6 +4,8 @@ English | [简体中文](./README.md)
 
 Complete web access for [pi](https://github.com/earendil-works/pi-mono) powered by a configurable OpenAI-compatible search model API + [Tavily](https://tavily.com/) + [Firecrawl](https://firecrawl.dev/).
 
+Use `/search-config` to select `model` (the existing search model) or `providers` (Exa, with Tavily fallback). In provider mode, the current pi model synthesizes results, and web fetching tries Firecrawl, Jina Reader, smart_direct, then direct. Manage provider keys and query Firecrawl or Tavily usage in the same menu. Exa balances cannot be verified with ordinary search keys. Keys are stored in plaintext in the local configuration file; protect that file. Rotation and cooldown state are process-local and reset on restart.
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## Architecture

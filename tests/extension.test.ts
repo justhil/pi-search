@@ -1,5 +1,7 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import { initTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 
 const smartFetchMock = vi.hoisted(() => vi.fn());
 const defuddleMock = vi.hoisted(() => vi.fn());
@@ -85,6 +87,7 @@ class FakePi {
 }
 
 const ENV_KEYS = [
+	"SEARCH_BACKEND",
 	"SEARCH_API_URL",
 	"SEARCH_API_KEY",
 	"SEARCH_API_PROTOCOL",
@@ -192,6 +195,69 @@ afterEach(() => {
 });
 
 describe("pi-search extension", () => {
+	it("rotates Exa keys and skips a rate-limited key", async () => {
+		process.env.SEARCH_BACKEND = "providers";
+		const path = process.env.PI_SEARCH_CONFIG_PATH!;
+		await mkdir(dirname(path), { recursive: true });
+		await writeFile(path, JSON.stringify({ exaApiKeys: ["pool-first", "pool-second"] }));
+		const seen: string[] = [];
+		globalThis.fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+			const key = new Headers(init?.headers).get("x-api-key") || "";
+			seen.push(key);
+			return key === "pool-first" ? new Response("limited", { status: 429 }) : jsonResponse({ results: [{ url: "https://example.com" }] });
+		}) as typeof fetch;
+		const result = await runTool(installExtension(), "search", { query: "example" });
+		expect(seen).toEqual(["pool-first", "pool-second"]);
+		expect(result.details?.sources_count).toBe(1);
+	});
+
+	it("falls back to Tavily when Exa is unavailable", async () => {
+		process.env.SEARCH_BACKEND = "providers";
+		process.env.EXA_API_KEY = "unavailable-exa";
+		process.env.TAVILY_API_KEY = "fallback-tavily";
+		const urls: string[] = [];
+		globalThis.fetch = vi.fn(async (input: string | URL | Request) => {
+			const url = String(input);
+			urls.push(url);
+			if (url.includes("exa.test")) return new Response("failure", { status: 500 });
+			return jsonResponse({ results: [{ url: "https://example.com", content: "fallback" }] });
+		}) as typeof fetch;
+		const result = await runTool(installExtension(), "search", { query: "example" });
+		expect(urls).toHaveLength(2);
+		expect(urls[1]).toContain("tavily");
+		expect(result.content[0].text).toContain("fallback");
+	});
+
+	it("uses Jina after Firecrawl fails in provider mode", async () => {
+		process.env.SEARCH_BACKEND = "providers";
+		process.env.FIRECRAWL_API_KEY = "test-firecrawl-key";
+		const calls: string[] = [];
+		globalThis.fetch = vi.fn(async (input: string | URL | Request) => {
+			const url = String(input);
+			calls.push(url);
+			if (url.includes("firecrawl")) return new Response("error", { status: 500 });
+			if (url.startsWith("https://r.jina.ai/")) return textResponse("Jina page content");
+			throw new Error("unexpected request");
+		}) as typeof fetch;
+		const result = await runTool(installExtension(), "web_fetch", { url: "https://example.com", format: "markdown" });
+		expect(calls).toHaveLength(2);
+		expect(calls[0]).toContain("firecrawl");
+		expect(calls[1]).toBe("https://r.jina.ai/https://example.com/");
+		expect(result.content[0].text).toContain("Jina page content");
+	});
+
+	it("uses Exa in provider mode without calling the search model", async () => {
+		process.env.SEARCH_BACKEND = "providers";
+		process.env.EXA_API_KEY = "test-exa-key";
+		const fetchMock = vi.fn(async (_input: string | URL | Request) => jsonResponse({ results: [{ url: "https://example.com", title: "Example", highlights: ["Evidence"] }] }));
+		globalThis.fetch = fetchMock as typeof fetch;
+		const result = await runTool(installExtension(), "search", { query: "example" });
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(String(fetchMock.mock.calls[0]?.[0])).toBe("https://exa.test/search");
+		expect(result.content[0].text).toContain("Evidence");
+		expect(result.details?.backend).toBe("providers");
+	});
+
 	it("registers the enhanced search tools without legacy planning tools by default", () => {
 		const pi = installExtension();
 

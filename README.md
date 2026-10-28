@@ -4,6 +4,8 @@
 
 通过可配置的 OpenAI-compatible 搜索模型 API + [Context7](https://context7.com/) + [Exa](https://exa.ai/) + [Tavily](https://tavily.com/) + [Firecrawl](https://firecrawl.dev/) 为 [pi](https://github.com/earendil-works/pi-mono) 提供完整的网络访问能力。
 
+可在 `/search-config` 中切换搜索后端：`model` 保持原有模型搜索，`providers` 优先使用 Exa、失败或无结果时使用 Tavily，由当前 pi 模型整理结果。引擎模式下网页抓取优先 Firecrawl，随后尝试 Jina Reader、smart_direct 和 direct；其他模式保留原顺序。可通过“管理 Key 池”添加或删除各服务商的 Key，通过“查看服务额度”查询 Firecrawl 和 Tavily；Exa 实际余额无法通过普通搜索 Key 确认。密钥明文存储于本机配置文件，请保护该文件。Key 轮询和冷却状态仅在当前进程中保存，重启后重置。
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## 双引擎架构
